@@ -49,3 +49,15 @@ API
 .. automodule:: vcr.patch
    :members:
    :special-members: __init__
+
+:mod:`~vcr.cassette_merge`
+---------------------------
+
+.. automodule:: vcr.cassette_merge
+   :members:
+
+:mod:`~vcr.persisters.filesystem`
+---------------------------------
+
+.. automodule:: vcr.persisters.filesystem
+   :members:

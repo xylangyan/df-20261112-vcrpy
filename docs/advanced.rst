@@ -187,6 +187,46 @@ You can also use a persister for a single cassette::
     with my_vcr.use_cassette('fixtures/vcr_cassettes/synopsis.yaml', persister=CustomPersister):
         ...
 
+Record into one cassette from several processes
+-----------------------------------------------
+
+When several test processes record into the same cassette, each one
+reads the file, adds its own interactions and writes the whole file
+back, so the process that exits last overwrites the interactions the
+others just recorded. ``MergingFilesystemPersister`` avoids that: on
+load it remembers the cassette's interactions, and on save it reads the
+file again and three-way merges the file, the remembered interactions
+and the ones being saved. Interactions recorded at different positions
+are combined, keeping the original order, while interactions both sides
+rewrote at the same position are reported as a
+``CassetteMergeConflictError`` and leave the file untouched.
+
+.. code:: python
+
+    import vcr
+    from vcr.persisters.filesystem import MergingFilesystemPersister
+
+    my_vcr = vcr.VCR()
+    my_vcr.register_persister(MergingFilesystemPersister)
+
+If you want such conflicts resolved automatically instead of reported,
+declare a policy with ``FilesystemPersister.configure``:
+``"keep_theirs"`` keeps the interaction currently in the file, and
+``"keep_mine"`` keeps the interaction the saving process recorded.
+
+.. code:: python
+
+    from vcr.persisters.filesystem import FilesystemPersister
+
+    merging_persister = FilesystemPersister.configure(safe_append=True, on_conflict="keep_theirs")
+    my_vcr.register_persister(merging_persister)
+
+The merge uses the serializer's plain ``serialize``/``deserialize``
+form, so custom serializers keep working unchanged. Both this
+persister and the default one save through a temporary file and
+atomically replace the cassette, so a process that exits while writing
+leaves the previous, still-readable cassette in place.
+
 Filter sensitive data from the request
 --------------------------------------
 

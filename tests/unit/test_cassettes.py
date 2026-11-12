@@ -17,7 +17,7 @@ from vcr.errors import (
     UnhandledHTTPRequestError,
 )
 from vcr.patch import force_reset
-from vcr.persisters.filesystem import CassetteNotFoundError
+from vcr.persisters.filesystem import CassetteNotFoundError, MergingFilesystemPersister
 from vcr.request import Request
 from vcr.stubs import VCRHTTPSConnection
 
@@ -876,3 +876,36 @@ def test_metadata_with_persister_without_metadata():
     cassette = Cassette.load(path=path, persister=_MemoryPersister, record_mode="new_episodes")
     assert len(cassette) == 1
     assert cassette.get_metadata("key", "value") == "value"
+
+
+def test_merging_persister_combines_two_cassette_instances(tmpdir):
+    # Two processes read the same cassette generation, record different
+    # interactions and save one after the other: both additions survive.
+    path = str(tmpdir.join("merged.yaml"))
+
+    def interaction(name):
+        request = Request("GET", f"http://example.com/{name}", None, {})
+        response = {
+            "status": {"code": 200, "message": "OK"},
+            "headers": {},
+            "body": {"string": name.encode()},
+        }
+        return request, response
+
+    process_a = Cassette.load(path=path, persister=MergingFilesystemPersister)
+    process_a.append(*interaction("a"))
+    process_a._save()
+
+    process_b = Cassette.load(path=path, persister=MergingFilesystemPersister)
+    process_c = Cassette.load(path=path, persister=MergingFilesystemPersister)
+    process_b.append(*interaction("b"))
+    process_c.append(*interaction("c"))
+    process_b._save()
+    process_c._save()
+
+    final = Cassette.load(path=path, persister=MergingFilesystemPersister)
+    assert [request.uri for request in final.requests] == [
+        "http://example.com/a",
+        "http://example.com/b",
+        "http://example.com/c",
+    ]

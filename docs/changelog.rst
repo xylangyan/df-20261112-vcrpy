@@ -5,6 +5,7 @@ All help in providing PRs to close out bug issues is appreciated. Even if that i
 
 -  Unreleased
     - CI: also test with urllib3 1.26, which vcrpy supports but CI didn't test, so #1092 wasn't caught
+    - New ``MergingFilesystemPersister`` and ``FilesystemPersister.configure(safe_append=True, on_conflict=...)`` for test processes that record into the same cassette. Each save re-reads the file and three-way merges it with the interactions present when the cassette was loaded, so non-overlapping recordings are combined instead of the last save overwriting the others; interactions both sides rewrote raise ``CassetteMergeConflictError`` by default, or are resolved with the ``"keep_theirs"``/``"keep_mine"`` policies. Saves now go through a temporary file and atomically replace the cassette, so a process exiting mid-write leaves the old cassette readable
 
 -  9.4.2
     - Fix urllib3 pools with ``block=True``, e.g. a requests session with ``HTTPAdapter(pool_block=True)``, waiting forever for a free connection in a cassette, or when used before, after or across cassettes. A response now returns its connection to the pool once its body has been read, as in urllib3, and vcrpy keeps a pool's free slots when it takes connections out of it as a cassette starts or stops using the pool. A response finished after its cassette has exited gives back only the slot, not the cassette's connection (#949) - thanks @nk-batman21
