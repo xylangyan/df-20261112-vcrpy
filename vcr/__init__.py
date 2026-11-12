@@ -1,6 +1,7 @@
 import logging
 from logging import NullHandler
 
+from .cassette import PlaybackSession  # noqa: F401
 from .config import VCR
 from .record_mode import RecordMode as mode  # noqa: F401
 from .request import Request  # noqa: F401

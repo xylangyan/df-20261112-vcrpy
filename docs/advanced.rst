@@ -681,6 +681,32 @@ recorded response instead of being sent and recorded again.
             response = urllib.request.urlopen('http://www.zombo.com/').read()
         assert cass.all_played
 
+Independent Playback Sessions
+-----------------------------
+
+A cassette keeps one consumption cursor of its own, so two callers replaying
+the same cassette at once can steal each other's responses. This shows up with
+paginating APIs that sometimes return the same next-page URL twice in a row:
+once one caller has played an interaction, the other can't.
+
+``Cassette.playback_session()`` creates an independent
+:class:`~vcr.cassette.PlaybackSession`. Sessions share the cassette's recorded
+interactions, which stay read-only for them, but each keeps its own play
+counts. The same rules apply within a session: every interaction plays once
+unless ``allow_playback_repeats`` is set, ``rewind()`` resets only that
+session, and exhausting the cassette still raises ``UnhandledHTTPRequestError``.
+
+A session is a context manager. Leaving it, normally or through an exception,
+closes only that session and releases it; its final progress stays readable,
+and the cassette and every other session keep their own cursors.
+
+.. code:: python
+
+    cassette = Cassette.load(path="pages.yaml")
+    with cassette.playback_session() as first, cassette.playback_session() as second:
+        first.play_response(request)   # both sessions get page 1, then 2, ...
+        second.play_response(request)  # independently of each other
+
 Discards Cassette on Errors
 ---------------------------
 

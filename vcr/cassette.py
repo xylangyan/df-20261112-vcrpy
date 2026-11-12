@@ -329,6 +329,17 @@ class Cassette:
     def rewind(self):
         self.play_counts = collections.Counter()
 
+    def playback_session(self):
+        """Create an independent playback session over this cassette.
+
+        The session shares this cassette's recorded interactions, which stay
+        read-only for it, but keeps its own consumption progress (play counts),
+        so several sessions can play the same cassette concurrently without
+        consuming each other's responses. The cassette's own progress is left
+        untouched.
+        """
+        return PlaybackSession(self)
+
     def find_requests_with_most_matches(self, request):
         """
         Get the most similar request(s) stored in the cassette
@@ -503,6 +514,113 @@ class Cassette:
             if self.play_counts[index] == 0 or self.allow_playback_repeats:
                 return True
         return False
+
+
+class PlaybackSession:
+    """An independent playback cursor over a cassette's recorded interactions.
+
+    Sessions created with :meth:`Cassette.playback_session` share the
+    cassette's interactions, which stay read-only for them, but each keeps its
+    own play counts. The same-session rules are unchanged: an interaction is
+    played once unless the cassette allows playback repeats, ``rewind()``
+    resets only this session, and a request with nothing left to play raises
+    ``UnhandledHTTPRequestError``.
+
+    A session is a context manager. Exiting it, normally or through an
+    exception, closes the session and releases it so no more responses can be
+    played; its final progress stays available. The cassette and any other
+    session keep their own cursors untouched.
+    """
+
+    def __init__(self, cassette):
+        self.cassette = cassette
+        self.play_counts = collections.Counter()
+        self._closed = False
+
+    @property
+    def allow_playback_repeats(self):
+        return self.cassette.allow_playback_repeats
+
+    @property
+    def play_count(self):
+        return sum(self.play_counts.values())
+
+    @property
+    def all_played(self):
+        """Returns True if this session has played every interaction."""
+        return len(self.play_counts.values()) == len(self.cassette)
+
+    @property
+    def remaining(self):
+        """Number of recorded interactions this session hasn't played yet."""
+        return len(self.cassette) - len(self.play_counts.values())
+
+    @property
+    def closed(self):
+        return self._closed
+
+    def _check_open(self):
+        if self._closed:
+            raise ValueError("This playback session is closed.")
+
+    def can_play_response_for(self, request):
+        self._check_open()
+        request = self.cassette._before_record_request(request)
+        return (
+            request
+            and request in self
+            and self.cassette.record_mode != RecordMode.ALL
+            and (self.cassette.rewound or self.allow_playback_repeats)
+        )
+
+    def play_response(self, request):
+        """
+        Get the response corresponding to a request, but only if this
+        session hasn't played it back before, and mark it as played.
+        """
+        self._check_open()
+        for index, response in self.cassette._responses(request):
+            if self.play_counts[index] == 0 or self.allow_playback_repeats:
+                self.play_counts[index] += 1
+                return response
+        # This session has nothing left that matches the request.
+        raise UnhandledHTTPRequestError(
+            f"The cassette ({self.cassette._path!r}) doesn't contain the request ({request!r}) asked for",
+        )
+
+    def rewind(self):
+        """Reset this session's progress only; other sessions keep theirs."""
+        self._check_open()
+        self.play_counts = collections.Counter()
+
+    def close(self):
+        """Close the session so it can't play more responses.
+
+        The final play counts remain readable. Safe to call more than once.
+        """
+        self._closed = True
+
+    def __enter__(self):
+        self._check_open()
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+        return False
+
+    def __contains__(self, request):
+        """Return whether this session can still play a response for the request"""
+        for index, _ in self.cassette._responses(request):
+            if self.play_counts[index] == 0 or self.allow_playback_repeats:
+                return True
+        return False
+
+    def __len__(self):
+        """Return the number of recorded interactions shared with the cassette"""
+        return len(self.cassette)
+
+    def __str__(self):
+        return f"<PlaybackSession of {self.cassette}>"
 
 
 def _hooks(hooks):
