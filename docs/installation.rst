@@ -66,8 +66,28 @@ cassettes to the new 1.x format. To use it, run the following command::
 The PATH can be either a path to the directory with cassettes or the
 path to a single cassette.
 
+Response headers in old cassettes come in a few shapes. The migration
+script recognizes them and converts them to the current dict-of-lists
+format:
+
+- a list of raw ``Name: value`` lines (0.x cassettes): parsed, keeping
+  repeated names, their order and empty values;
+- a dict mapping each name to a single value: wrapped in a one-element
+  list;
+- a dict mapping each name to a list of values (already the current
+  format): left untouched, and the file is not rewritten.
+
+Repeated headers that a previous edit flattened into one comma-joined
+string cannot be split back into their original entries, because the
+boundaries are not recoverable. The migration keeps that value as a
+single header and emits a ``FlattenedHeadersWarning`` naming the
+response and header, so the affected record is easy to find and
+re-record. Running the migration twice is a no-op, and a cassette that
+can't be migrated is left unchanged rather than overwritten.
+
 *Note*: Back up your cassettes files before migration. The migration
-*should* only modify cassettes using the old 0.x format.
+*should* only modify cassettes using the old 0.x format, or version-1
+cassettes whose response headers still use one of the shapes above.
 
 New serializer / deserializer API
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

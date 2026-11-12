@@ -250,3 +250,27 @@ def test_deserialize_no_body_string():
     data = {"body": {"string": None}}
     output = compat.convert_to_bytes(data)
     assert data == output
+
+
+def test_normalize_response_headers_shapes():
+    assert compat.normalize_response_headers(None) == {}
+    assert compat.normalize_response_headers(["a: 1\r\n", "a: 2\r\n", "b: \r\n"]) == {
+        "a": ["1", "2"],
+        "b": [""],
+    }
+    assert compat.normalize_response_headers({"a": ["1", "2"], "b": [None]}) == {
+        "a": ["1", "2"],
+        "b": [None],
+    }
+    with pytest.warns(compat.FlattenedHeadersWarning, match="'a'"):
+        assert compat.normalize_response_headers({"a": "x, y", "b": None}) == {
+            "a": ["x, y"],
+            "b": [None],
+        }
+
+
+def test_normalize_response_headers_unrecognized_shape():
+    with pytest.raises(ValueError, match="unrecognized response headers shape"):
+        compat.normalize_response_headers(42)
+    with pytest.raises(ValueError, match="unparseable response header line"):
+        compat.normalize_response_headers(["good: 1", "line without a colon"])

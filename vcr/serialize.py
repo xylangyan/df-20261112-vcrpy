@@ -52,7 +52,19 @@ def deserialize(cassette_string, serializer):
         _warn_about_old_cassette_format()
 
     requests = [Request._from_dict(r["request"]) for r in data["interactions"]]
-    responses = [compat.convert_to_bytes(r["response"]) for r in data["interactions"]]
+    responses = []
+    for index, interaction in enumerate(data["interactions"]):
+        response = interaction["response"]
+        if isinstance(response, dict):
+            # Hand-edited or partially migrated cassettes can still carry a
+            # recognizable legacy response header shape; normalize it on load
+            # so replay uses the recorded values instead of silently
+            # mis-parsing them.
+            response["headers"] = compat.normalize_response_headers(
+                response.get("headers"),
+                context=f"response {index}",
+            )
+        responses.append(compat.convert_to_bytes(response))
     if data.get("metadata"):
         return requests, responses, data["metadata"]
     return requests, responses
