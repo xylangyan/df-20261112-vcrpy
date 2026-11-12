@@ -452,3 +452,120 @@ def test_body_matcher_diff_is_capped():
     assert len(lines) == matchers.MAX_DIFF_LINES + 1
     assert lines[-1].startswith("… (") and lines[-1].endswith(" more lines)")
     assert all(len(line) <= matchers.MAX_DIFF_LINE_LENGTH + 1 for line in lines)
+
+
+def _order_sensitive_matcher(*parameters):
+    return matchers.order_sensitive_query_matcher(parameters)
+
+
+def test_order_sensitive_query_matcher_matches_regardless_of_other_parameters():
+    matcher = _order_sensitive_matcher("sort")
+    recorded = request.Request("GET", "http://host.com/p?sort=region&sort=date&page=1&size=10", "", {})
+    shuffled = request.Request("GET", "http://host.com/p?size=10&sort=region&page=1&sort=date", "", {})
+    assert matcher(recorded, shuffled) is None
+    assert matcher(shuffled, recorded) is None
+
+
+def test_order_sensitive_query_matcher_rejects_reordered_parameters():
+    matcher = _order_sensitive_matcher("sort")
+    recorded = request.Request("GET", "http://host.com/p?sort=region&sort=date", "", {})
+    reordered = request.Request("GET", "http://host.com/p?sort=date&sort=region", "", {})
+    with pytest.raises(AssertionError):
+        matcher(recorded, reordered)
+    with pytest.raises(AssertionError):
+        matcher(reordered, recorded)
+
+
+def test_order_sensitive_query_matcher_ignores_unlisted_parameters():
+    matcher = _order_sensitive_matcher("sort")
+    r1 = request.Request("GET", "http://host.com/p?filter=a&sort=x&filter=b", "", {})
+    r2 = request.Request("GET", "http://host.com/p?filter=b&sort=x&filter=a", "", {})
+    assert matcher(r1, r2) is None
+
+
+def test_order_sensitive_query_matcher_still_rejects_different_other_parameters():
+    matcher = _order_sensitive_matcher("sort")
+    r1 = request.Request("GET", "http://host.com/p?sort=x&page=1", "", {})
+    r2 = request.Request("GET", "http://host.com/p?sort=x&page=2", "", {})
+    with pytest.raises(AssertionError):
+        matcher(r1, r2)
+
+
+def test_order_sensitive_query_matcher_handles_blank_values():
+    matcher = _order_sensitive_matcher("sort")
+    r1 = request.Request("GET", "http://host.com/p?sort=&sort=date", "", {})
+    r2 = request.Request("GET", "http://host.com/p?sort=&sort=date", "", {})
+    r3 = request.Request("GET", "http://host.com/p?sort=date&sort=", "", {})
+    assert matcher(r1, r2) is None
+    with pytest.raises(AssertionError):
+        matcher(r1, r3)
+
+
+def test_order_sensitive_query_matcher_decodes_percent_encoding():
+    matcher = _order_sensitive_matcher("sort")
+    r1 = request.Request("GET", "http://host.com/p?sort=a%20b&sort=c", "", {})
+    r2 = request.Request("GET", "http://host.com/p?sort=a+b&sort=c", "", {})
+    r3 = request.Request("GET", "http://host.com/p?sort=c&sort=a%20b", "", {})
+    assert matcher(r1, r2) is None
+    with pytest.raises(AssertionError):
+        matcher(r1, r3)
+
+
+def test_order_sensitive_query_matcher_repeated_keys_in_order():
+    matcher = _order_sensitive_matcher("sort")
+    r1 = request.Request("GET", "http://host.com/p?sort=a&sort=a&sort=b", "", {})
+    r2 = request.Request("GET", "http://host.com/p?sort=a&sort=b&sort=a", "", {})
+    with pytest.raises(AssertionError):
+        matcher(r1, r2)
+
+
+def test_order_sensitive_query_matcher_rejects_missing_and_extra_parameters():
+    matcher = _order_sensitive_matcher("sort")
+    r1 = request.Request("GET", "http://host.com/p?sort=a&sort=b", "", {})
+    r2 = request.Request("GET", "http://host.com/p?sort=a", "", {})
+    r3 = request.Request("GET", "http://host.com/p?sort=a&sort=b&sort=c", "", {})
+    with pytest.raises(AssertionError):
+        matcher(r1, r2)
+    with pytest.raises(AssertionError):
+        matcher(r1, r3)
+
+
+def test_order_sensitive_query_matcher_message_distinguishes_order_from_values():
+    matcher = _order_sensitive_matcher("sort")
+    recorded = request.Request("GET", "http://host.com/p?sort=region&sort=date", "", {})
+
+    reordered = request.Request("GET", "http://host.com/p?sort=date&sort=region", "", {})
+    with pytest.raises(AssertionError) as exc_info:
+        matcher(recorded, reordered)
+    message = str(exc_info.value)
+    assert "right values but the wrong order" in message
+    assert "sort=region&sort=date" in message
+    assert "sort=date&sort=region" in message
+
+    different = request.Request("GET", "http://host.com/p?sort=region&sort=name", "", {})
+    with pytest.raises(AssertionError) as exc_info:
+        matcher(recorded, different)
+    message = str(exc_info.value)
+    assert "order-sensitive query parameters differ" in message
+    assert "wrong order" not in message
+
+
+def test_order_sensitive_query_matcher_message_for_other_parameters():
+    matcher = _order_sensitive_matcher("sort")
+    r1 = request.Request("GET", "http://host.com/p?sort=x&page=1", "", {})
+    r2 = request.Request("GET", "http://host.com/p?sort=x&page=2", "", {})
+    with pytest.raises(AssertionError) as exc_info:
+        matcher(r1, r2)
+    message = str(exc_info.value)
+    assert "query parameters differ" in message
+    assert "order-sensitive" not in message
+
+
+def test_order_sensitive_query_matcher_is_standalone():
+    matcher = _order_sensitive_matcher("sort")
+    assert matcher.__name__ == "order_sensitive_query"
+    assert matcher.order_sensitive_parameters == frozenset({"sort"})
+    # The shared default matcher keeps its order-insensitive behavior.
+    r1 = request.Request("GET", "http://host.com/p?sort=region&sort=date", "", {})
+    r2 = request.Request("GET", "http://host.com/p?sort=date&sort=region", "", {})
+    assert matchers.query(r1, r2) is None

@@ -10,6 +10,7 @@ from unittest import mock
 import pytest
 import yaml
 
+from vcr import matchers
 from vcr.cassette import Cassette
 from vcr.errors import (
     CannotOverwriteExistingCassetteException,
@@ -876,3 +877,53 @@ def test_metadata_with_persister_without_metadata():
     cassette = Cassette.load(path=path, persister=_MemoryPersister, record_mode="new_episodes")
     assert len(cassette) == 1
     assert cassette.get_metadata("key", "value") == "value"
+
+
+def _response_with_marker(marker):
+    return {
+        "status": {"code": 200, "message": "OK"},
+        "headers": {},
+        "body": {"string": marker.encode()},
+    }
+
+
+def _cassette_with_two_sort_orders():
+    # Two recordings on the same path, differing only in the order of the
+    # repeated "sort" parameter, each with its own marker in the body.
+    cassette = Cassette(
+        "test",
+        match_on=[
+            matchers.method,
+            matchers.scheme,
+            matchers.host,
+            matchers.port,
+            matchers.path,
+            matchers.order_sensitive_query_matcher(["sort"]),
+        ],
+    )
+    cassette.append(
+        Request("GET", "http://host.com/search?sort=region&sort=date&page=1", "", {}),
+        _response_with_marker("region-then-date"),
+    )
+    cassette.append(
+        Request("GET", "http://host.com/search?sort=date&sort=region&page=1", "", {}),
+        _response_with_marker("date-then-region"),
+    )
+    return cassette
+
+
+def test_cassette_matches_each_sort_order_to_its_own_recording():
+    cassette = _cassette_with_two_sort_orders()
+    # Unrelated parameters are shuffled and one is percent-encoded
+    # differently; each sort order still gets its own marker back.
+    first = Request("GET", "http://host.com/search?page=1&sort=region&sort=date", "", {})
+    second = Request("GET", "http://host.com/search?sort=date&page=1&sort=region", "", {})
+    assert cassette.play_response(first)["body"]["string"] == b"region-then-date"
+    assert cassette.play_response(second)["body"]["string"] == b"date-then-region"
+
+
+def test_cassette_with_order_sensitive_matcher_rejects_unknown_sort_order():
+    cassette = _cassette_with_two_sort_orders()
+    unknown = Request("GET", "http://host.com/search?sort=date&sort=date&page=1", "", {})
+    with pytest.raises(UnhandledHTTPRequestError):
+        cassette.play_response(unknown)

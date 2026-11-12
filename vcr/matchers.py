@@ -4,6 +4,7 @@ import logging
 import urllib
 import xmlrpc.client
 from string import hexdigits
+from urllib.parse import parse_qsl
 from xml.parsers.expat import ExpatError
 
 from .util import read_body
@@ -63,6 +64,59 @@ def path(r1, r2):
 def query(r1, r2):
     if r1.query != r2.query:
         raise AssertionError(f"{r1.query} != {r2.query}")
+
+
+def _query_pairs(request):
+    # Same parsing as Request.query (which backs the default query matcher):
+    # blanks and percent-encoding are handled by parse_qsl, and repeated keys
+    # stay as separate pairs in their original order.
+    return parse_qsl(request.parsed_uri.query, keep_blank_values=True)
+
+
+def _format_pairs(pairs):
+    return "&".join(f"{key}={value}" for key, value in pairs)
+
+
+def order_sensitive_query_matcher(order_sensitive_parameters):
+    """Build a query matcher that keeps the order of named parameters.
+
+    The default ``query`` matcher sorts every query parameter, so
+    ``?sort=region&sort=date`` and ``?sort=date&sort=region`` are treated as
+    identical. Parameters named in ``order_sensitive_parameters`` are compared
+    in the order they appear instead, including repeated occurrences of the
+    same key. Every other parameter keeps the default order-insensitive
+    comparison.
+
+    The returned matcher is a standalone closure, so configuring it for one
+    cassette leaves the shared default ``query`` matcher untouched.
+    """
+    order_sensitive = frozenset(order_sensitive_parameters)
+
+    def order_sensitive_query(r1, r2):
+        pairs1, pairs2 = _query_pairs(r1), _query_pairs(r2)
+        sensitive1 = [pair for pair in pairs1 if pair[0] in order_sensitive]
+        sensitive2 = [pair for pair in pairs2 if pair[0] in order_sensitive]
+        other1 = sorted(pair for pair in pairs1 if pair[0] not in order_sensitive)
+        other2 = sorted(pair for pair in pairs2 if pair[0] not in order_sensitive)
+
+        if other1 != other2:
+            raise AssertionError(
+                f"query parameters differ: {_format_pairs(other1)} != {_format_pairs(other2)}",
+            )
+        if sensitive1 != sensitive2:
+            if sorted(sensitive1) == sorted(sensitive2):
+                raise AssertionError(
+                    "order-sensitive query parameters have the right values "
+                    f"but the wrong order: {_format_pairs(sensitive1)} != {_format_pairs(sensitive2)}",
+                )
+            raise AssertionError(
+                f"order-sensitive query parameters differ: "
+                f"{_format_pairs(sensitive1)} != {_format_pairs(sensitive2)}",
+            )
+
+    order_sensitive_query.__name__ = "order_sensitive_query"
+    order_sensitive_query.order_sensitive_parameters = order_sensitive
+    return order_sensitive_query
 
 
 MAX_DIFF_LINES = 20

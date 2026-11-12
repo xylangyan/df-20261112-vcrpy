@@ -542,3 +542,38 @@ def test_force_reset_does_not_unpatch_a_cassette_opened_during_the_window():
         gc.enable()
 
     assert httplib.HTTPConnection is _HTTPConnection
+
+
+def test_order_sensitive_query_matcher_factory_builds_standalone_matcher():
+    my_vcr = VCR()
+    matcher = my_vcr.order_sensitive_query_matcher(["sort"])
+    assert matcher.__name__ == "order_sensitive_query"
+    assert matcher.order_sensitive_parameters == frozenset({"sort"})
+    # The shared default query matcher and registry stay untouched.
+    assert "order_sensitive_query" not in my_vcr.matchers
+    assert my_vcr.match_on == ("method", "scheme", "host", "port", "path", "query")
+
+
+def test_order_sensitive_query_matcher_is_applied_per_cassette():
+    my_vcr = VCR(inject_cassette=True)
+    default_matchers = tuple(my_vcr._get_matchers(my_vcr.match_on))
+
+    custom_matcher = my_vcr.order_sensitive_query_matcher(["sort"])
+
+    @my_vcr.use_cassette(
+        "ordered.yaml",
+        match_on=["method", "scheme", "host", "port", "path", custom_matcher],
+    )
+    def ordered(cassette):
+        assert custom_matcher in cassette._match_on
+        assert my_vcr.matchers["query"] not in cassette._match_on
+        return tuple(cassette._match_on)
+
+    ordered_matchers = ordered()
+    assert ordered_matchers != default_matchers
+
+    @my_vcr.use_cassette
+    def default(cassette):
+        return tuple(cassette._match_on)
+
+    assert default() == default_matchers

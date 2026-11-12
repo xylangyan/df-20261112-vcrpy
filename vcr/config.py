@@ -105,11 +105,16 @@ class VCR:
 
     def _get_matchers(self, matcher_names):
         matchers = []
-        try:
-            for m in matcher_names:
+        for m in matcher_names:
+            if callable(m):
+                # A matcher function (e.g. built by order_sensitive_query_matcher)
+                # passed directly instead of a registered name.
+                matchers.append(m)
+                continue
+            try:
                 matchers.append(self.matchers[m])
-        except KeyError:
-            raise KeyError(f"Matcher {m} doesn't exist or isn't registered") from None
+            except KeyError:
+                raise KeyError(f"Matcher {m} doesn't exist or isn't registered") from None
         return matchers
 
     def use_cassette(self, path=None, **kwargs):
@@ -282,6 +287,28 @@ class VCR:
 
     def register_matcher(self, name, matcher):
         self.matchers[name] = matcher
+
+    @staticmethod
+    def order_sensitive_query_matcher(order_sensitive_parameters):
+        """Build a query matcher that keeps the order of the named parameters.
+
+        The default ``query`` matcher sorts parameters, so
+        ``?sort=region&sort=date`` and ``?sort=date&sort=region`` match the
+        same recording. This factory returns a matcher that compares the named
+        parameters in the order they appear (repeated keys included) and every
+        other parameter order-insensitively. Pass it to ``match_on`` to apply
+        it to a single cassette without changing the shared default matcher::
+
+            with my_vcr.use_cassette(
+                "search.yaml",
+                match_on=[
+                    "method", "scheme", "host", "port", "path",
+                    my_vcr.order_sensitive_query_matcher(["sort"]),
+                ],
+            ):
+                ...
+        """
+        return matchers.order_sensitive_query_matcher(order_sensitive_parameters)
 
     def register_persister(self, persister):
         # Singleton, no name required

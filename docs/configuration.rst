@@ -56,6 +56,41 @@ The following options are available :
    Backwards compatible matchers:
 -  url (the ``uri`` alias)
 
+Order-sensitive query parameters
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``query`` matcher sorts every query parameter before comparing, so a
+request recorded with ``?sort=region&sort=date`` is also replayed for
+``?sort=date&sort=region``. That is convenient when parameter order is
+meaningless, but some APIs use the order of a repeated parameter (e.g. two
+``sort`` keys to express primary and secondary sorting) as part of the
+request.
+
+Use ``VCR.order_sensitive_query_matcher`` to build a query matcher that keeps
+the order of the parameters you name, while every other parameter keeps the
+default order-insensitive comparison. Blank values, percent-encoding and
+repeated keys are parsed exactly as the default ``query`` matcher does.
+
+.. code:: python
+
+    my_vcr = vcr.VCR()
+
+    with my_vcr.use_cassette(
+        'search.yaml',
+        match_on=[
+            'method', 'scheme', 'host', 'port', 'path',
+            my_vcr.order_sensitive_query_matcher(['sort']),
+        ],
+    ):
+        # ?sort=region&sort=date and ?sort=date&sort=region are now
+        # distinct requests, but ?page=1&size=10 still matches ?size=10&page=1
+        ...
+
+The matcher is built per cassette, so the shared default ``query`` matcher
+keeps its order-insensitive behavior. On a mismatch the assertion message
+says whether the order-sensitive parameters have different values or the
+same values in a different order.
+
 If these options don't work for you, you can also register your own
 request matcher. This is described in the Advanced section of this
 README.
