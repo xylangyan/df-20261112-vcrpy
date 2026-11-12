@@ -10,6 +10,7 @@ from unittest import mock
 import pytest
 import yaml
 
+from vcr import matchers
 from vcr.cassette import Cassette
 from vcr.errors import (
     CannotOverwriteExistingCassetteException,
@@ -436,7 +437,7 @@ def test_find_requests_with_most_matches_one_similar_request(mock_get_matchers_r
     for request in range(1, 4):
         cassette.append(request, "response")
     result = cassette.find_requests_with_most_matches("fake request")
-    assert result == [(2, ["method", "path"], [("query", "failed : query")])]
+    assert result == [(2, ["method", "path"], [("query", "failed : query")], 1)]
 
 
 @mock.patch("vcr.cassette.get_matchers_results")
@@ -467,9 +468,147 @@ def test_find_requests_with_most_matches_many_similar_requests(mock_get_matchers
         cassette.append(request, "response")
     result = cassette.find_requests_with_most_matches("fake request")
     assert result == [
-        (1, ["method", "path"], [("query", "failed : query")]),
-        (3, ["method", "path"], [("query", "failed : query")]),
+        (1, ["method", "path"], [("query", "failed : query")], 0),
+        (3, ["method", "path"], [("query", "failed : query")], 2),
     ]
+
+
+@mock.patch("vcr.cassette.get_matchers_results")
+def test_find_requests_with_most_matches_caps_the_results(mock_get_matchers_results):
+    mock_get_matchers_results.side_effect = [(["method"], [("path", "failed : path")])] * 10
+
+    cassette = Cassette("test")
+    for request in range(10):
+        cassette.append(request, "response")
+    result = cassette.find_requests_with_most_matches("fake request")
+    assert len(result) == 3
+    # Equally good matches keep their cassette order, so the result is stable.
+    assert [index for _request, _successes, _fails, index in result] == [0, 1, 2]
+
+
+def test_find_requests_with_most_matches_keeps_cassette_order_for_ties():
+    cassette = Cassette("test", match_on=(matchers.method, matchers.scheme))
+    cassette.append(Request("POST", "http://example.com/a", None, {}), "response")
+    cassette.append(Request("PUT", "http://example.com/b", None, {}), "response")
+    cassette.append(Request("PATCH", "http://example.com/c", None, {}), "response")
+
+    result = cassette.find_requests_with_most_matches(Request("GET", "http://example.com/z", None, {}))
+    assert [(request.method, index) for request, _successes, _fails, index in result] == [
+        ("POST", 0),
+        ("PUT", 1),
+        ("PATCH", 2),
+    ]
+
+
+def test_find_requests_with_most_matches_does_not_change_play_counts():
+    cassette = Cassette("test", match_on=(matchers.method, matchers.uri))
+    cassette.append(Request("GET", "http://example.com/a", None, {}), "response")
+    cassette.append(Request("GET", "http://example.com/b", None, {}), "response")
+    cassette.play_response(Request("GET", "http://example.com/a", None, {}))
+    assert dict(cassette.play_counts) == {0: 1}
+
+    cassette.find_requests_with_most_matches(Request("GET", "http://example.com/z", None, {}))
+    assert dict(cassette.play_counts) == {0: 1}
+    assert cassette.play_count == 1
+
+    # Building the exception diagnostics must not mark anything as played either.
+    CannotOverwriteExistingCassetteException(
+        cassette=cassette,
+        failed_request=Request("GET", "http://example.com/z", None, {}),
+    )
+    assert dict(cassette.play_counts) == {0: 1}
+    assert cassette.play_count == 1
+
+
+def test_find_requests_with_most_matches_with_custom_matchers():
+    def bool_matcher(r1, r2):
+        return r1.method == r2.method
+
+    def assertion_matcher(r1, r2):
+        # raise explicitly: pytest would rewrite an "assert" statement here
+        if r1.uri != r2.uri:
+            raise AssertionError(f"{r1.uri} != {r2.uri}")
+
+    cassette = Cassette("test", match_on=(bool_matcher, assertion_matcher))
+    cassette.append(Request("GET", "http://example.com/a", None, {}), "response")
+
+    result = cassette.find_requests_with_most_matches(Request("GET", "http://example.com/z", None, {}))
+    assert result == [
+        (
+            cassette.data[0][0],
+            ["bool_matcher"],
+            [("assertion_matcher", "http://example.com/z != http://example.com/a")],
+            0,
+        ),
+    ]
+
+
+MISMATCH_CANDIDATES_CASSETTE = "tests/fixtures/mismatch_candidates.yaml"
+
+
+def _mismatch_candidates_cassette():
+    return Cassette.load(
+        path=MISMATCH_CANDIDATES_CASSETTE,
+        match_on=(matchers.method, matchers.uri, matchers.query, matchers.body),
+    )
+
+
+def test_mismatch_candidates_locate_the_closest_interaction():
+    # The API gained a new "sort" query parameter, so playback reports no match.
+    cassette = _mismatch_candidates_cassette()
+    failed_request = Request(
+        "GET",
+        "http://api.example.com/v1/items?tag=a&tag=b&page=1&sort=name",
+        None,
+        {},
+    )
+    exc = CannotOverwriteExistingCassetteException(cassette=cassette, failed_request=failed_request)
+
+    assert exc.reason == "no_match"
+    # The closest candidate is the recorded GET on the same URL, at index 0.
+    request, succeeded, failed, index = exc.similar_requests[0]
+    assert index == 0
+    assert request.method == "GET"
+    assert request.uri == "http://api.example.com/v1/items?tag=a&tag=b&page=1"
+    assert succeeded == ["method", "body"]
+    # The first effective difference is the uri matcher, then query.
+    assert [name for name, _message in failed] == ["uri", "query"]
+    assert "sort" in failed[1][1]
+    # Reading the diagnostics didn't play anything back.
+    assert cassette.play_count == 0
+
+
+def test_mismatch_candidates_same_url_different_method():
+    cassette = _mismatch_candidates_cassette()
+    failed_request = Request(
+        "POST",
+        "http://api.example.com/v1/items?tag=a&tag=b&page=1",
+        b'{"name": "third"}',
+        {},
+    )
+    exc = CannotOverwriteExistingCassetteException(cassette=cassette, failed_request=failed_request)
+
+    # The two recorded POSTs on the same URL tie; cassette order breaks the tie.
+    assert [index for _request, _succeeded, _failed, index in exc.similar_requests] == [1, 2]
+    request, succeeded, failed, index = exc.similar_requests[0]
+    assert succeeded == ["method", "uri", "query"]
+    # The only difference is the request body, and the message shows the diff.
+    assert [name for name, _message in failed] == ["body"]
+    assert '-{"name": "first"}' in failed[0][1]
+    assert '+{"name": "third"}' in failed[0][1]
+
+
+def test_mismatch_candidates_repeated_query_parameters():
+    cassette = _mismatch_candidates_cassette()
+    # Same URL but only one of the repeated "tag" parameters.
+    failed_request = Request("GET", "http://api.example.com/v1/items?tag=a&page=1", None, {})
+    exc = CannotOverwriteExistingCassetteException(cassette=cassette, failed_request=failed_request)
+
+    request, succeeded, failed, index = exc.similar_requests[0]
+    assert index == 0
+    assert "method" in succeeded
+    assert [name for name, _message in failed] == ["uri", "query"]
+    assert "('tag', 'b')" in failed[1][1]
 
 
 def test_used_interactions(tmpdir):

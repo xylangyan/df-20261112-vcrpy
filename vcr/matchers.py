@@ -267,6 +267,15 @@ def _evaluate_matcher(matcher_function, *args):
     return match, assertion_message
 
 
+def _matcher_name(matcher):
+    """Name used for a matcher in diagnostics.
+
+    Custom matchers are usually functions (they have ``__name__``), but any
+    callable is accepted, so fall back to its repr rather than raising.
+    """
+    return getattr(matcher, "__name__", None) or repr(matcher)
+
+
 def get_matchers_results(r1, r2, matchers):
     """
     Get the comparison results of two requests as two list.
@@ -275,7 +284,7 @@ def get_matchers_results(r1, r2, matchers):
     """
     matches_success, matches_fails = [], []
     for m in matchers:
-        matcher_name = m.__name__
+        matcher_name = _matcher_name(m)
         match, assertion_message = _evaluate_matcher(m, r1, r2)
         if match:
             matches_success.append(matcher_name)

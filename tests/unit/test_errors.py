@@ -31,7 +31,7 @@ def _exception(cassette, similar_requests, request=None):
 def test_attributes():
     cassette = _cassette()
     request = _request()
-    similar = [(_request("http://example.com/bar"), ["method"], [("path", "/foo != /bar")])]
+    similar = [(_request("http://example.com/bar"), ["method"], [("path", "/foo != /bar")], 0)]
     exc = _exception(cassette, similar, request)
     assert exc.cassette is cassette
     assert exc.failed_request is request
@@ -52,7 +52,7 @@ def test_cassette_not_found():
 
 
 def test_already_played():
-    similar = [(_request(), ["method", "scheme", "host", "port", "path", "query"], [])]
+    similar = [(_request(), ["method", "scheme", "host", "port", "path", "query"], [], 0)]
     exc = _exception(_cassette(record_mode=RecordMode.NONE), similar)
     message = str(exc)
     assert exc.reason == "already_played"
@@ -68,13 +68,15 @@ def test_already_played():
 
 
 def test_already_played_several():
-    similar = [(_request(), ["method"], []), (_request(), ["method"], [])]
+    similar = [(_request(), ["method"], [], 0), (_request(), ["method"], [], 1)]
     message = str(_exception(_cassette(recorded=2), similar))
     assert "it matches 2 recorded interactions, but they have all been played back" in message
 
 
 def test_no_match_shows_closest_requests():
-    similar = [(_request("http://example.com/foo"), ["method", "path"], [("query", "[('page', '2')] != []")])]
+    similar = [
+        (_request("http://example.com/foo"), ["method", "path"], [("query", "[('page', '2')] != []")], 0),
+    ]
     exc = _exception(_cassette(), similar, _request("http://example.com/foo?page=2"))
     message = str(exc)
     assert message.splitlines()[:2] == [
@@ -82,29 +84,34 @@ def test_no_match_shows_closest_requests():
         "record_mode 'once' doesn't record new requests into an existing cassette.",
     ]
     assert "  GET http://example.com/foo?page=2\n" in message
-    assert "  1. GET http://example.com/foo\n     query differs: [('page', '2')] != []" in message
+    assert (
+        "  1. interaction 0: GET http://example.com/foo\n"
+        "     query differs: [('page', '2')] != []" in message
+    )
     assert "record_mode='new_episodes'" in message
 
 
 def test_no_match_with_multiline_matcher_message():
     diff = "--- recorded\n+++ this request\n-a\n+b"
-    similar = [(_request(), ["method"], [("body", diff)])]
+    similar = [(_request(), ["method"], [("body", diff)], 0)]
     message = str(_exception(_cassette(), similar))
     assert "     body differs:\n       --- recorded\n       +++ this request\n       -a\n       +b" in message
 
 
 def test_no_match_caps_the_number_of_similar_requests():
-    similar = [(_request(f"http://example.com/{i}"), ["method"], [("body", "")]) for i in range(200)]
+    similar = [
+        (_request(f"http://example.com/{i}"), ["method"], [("body", "")], i) for i in range(200)
+    ]
     message = str(_exception(_cassette(recorded=200), similar))
-    assert "  3. GET http://example.com/2\n" in message
+    assert "  3. interaction 2: GET http://example.com/2\n" in message
     assert "  4. " not in message
     assert "  …and 197 more that also differ in body." in message
     assert len(message) < 2000
 
 
 def test_no_match_groups_the_rest_by_differing_matchers():
-    body_only = (_request(), ["method"], [("body", "")])
-    path_and_body = (_request(), ["method"], [("path", ""), ("body", "")])
+    body_only = (_request(), ["method"], [("body", "")], 0)
+    path_and_body = (_request(), ["method"], [("path", ""), ("body", "")], 1)
     similar = [body_only] * 5 + [path_and_body] * 2
     message = str(_exception(_cassette(recorded=7), similar))
     assert "  …and 4 more:\n     2 differ in body\n     2 differ in path and body" in message

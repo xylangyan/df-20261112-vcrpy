@@ -10,8 +10,8 @@ PLAYBACK_REPEATS_DOCS = DOCS + "advanced.html#playback-repeats"
 REQUEST_MATCHING_DOCS = DOCS + "configuration.html#request-matching"
 IGNORE_REQUESTS_DOCS = DOCS + "advanced.html#ignore-requests"
 
-# Keep the message readable when a cassette holds many similar requests.
-MAX_SHOWN_SIMILAR_REQUESTS = 3
+# How many closest requests to attach to the exception and show in the message.
+MAX_SIMILAR_REQUESTS = 3
 MAX_BODY_PREVIEW = 300
 
 
@@ -22,9 +22,13 @@ class CannotOverwriteExistingCassetteException(Exception):
 
     - ``reason``: why the request couldn't be handled, one of ``"cassette_not_found"``,
       ``"already_played"``, ``"no_match"`` and ``"nothing_similar"``.
-    - ``similar_requests``: the recorded requests closest to ``failed_request``, as
-      ``(request, succeeded_matchers, failed_matchers)`` tuples, where ``failed_matchers``
-      is a list of ``(matcher_name, message)`` tuples.
+    - ``similar_requests``: at most ``MAX_SIMILAR_REQUESTS`` recorded requests closest to
+      ``failed_request``, as ``(request, succeeded_matchers, failed_matchers, index)`` tuples.
+      ``index`` is the interaction's zero-based position in the cassette file, ``succeeded_matchers``
+      lists the matcher names that passed, and ``failed_matchers`` is a list of
+      ``(matcher_name, message)`` tuples ordered like ``match_on``. Requests that score equally
+      keep their cassette order. Building this list only reads the cassette and never changes
+      play counts, so it is safe to use from offline log analysis.
     """
 
     def __init__(self, *args, **kwargs):
@@ -125,7 +129,7 @@ def _headline(cassette, similar_requests, reason, record_mode):
         not_recorded = f"record_mode '{record_mode}' doesn't record new requests into an existing cassette."
 
     if reason == "already_played":
-        count = sum(1 for _request, _succeeded, failed in similar_requests if not failed)
+        count = sum(1 for _request, _succeeded, failed, _index in similar_requests if not failed)
         if count == 1:
             problem = "it matches 1 recorded interaction, but that has already been played back"
         else:
@@ -164,10 +168,10 @@ def _preview(body):
 
 
 def _describe_similar_requests(similar_requests):
-    shown = similar_requests[:MAX_SHOWN_SIMILAR_REQUESTS]
+    shown = similar_requests[:MAX_SIMILAR_REQUESTS]
     lines = ["Closest recorded requests:"]
-    for number, (request, _succeeded, failed) in enumerate(shown, start=1):
-        lines.append(f"  {number}. {_describe_request(request, [])[0]}")
+    for number, (request, _succeeded, failed, index) in enumerate(shown, start=1):
+        lines.append(f"  {number}. interaction {index}: {_describe_request(request, [])[0]}")
         for name, message in failed:
             message = (message or "").strip()
             if not message or "\n" in message:
@@ -176,9 +180,12 @@ def _describe_similar_requests(similar_requests):
             else:
                 lines.append(f"     {name} differs: {message}")
 
-    rest = similar_requests[MAX_SHOWN_SIMILAR_REQUESTS:]
+    rest = similar_requests[MAX_SIMILAR_REQUESTS:]
     if rest:
-        groups = Counter(tuple(name for name, _message in failed) for _request, _succeeded, failed in rest)
+        groups = Counter(
+            tuple(name for name, _message in failed)
+            for _request, _succeeded, failed, _index in rest
+        )
         if len(groups) == 1:
             ((names, count),) = groups.items()
             lines.append(f"  …and {count} more that also differ in {_join_names(names)}.")

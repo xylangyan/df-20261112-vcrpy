@@ -83,6 +83,13 @@ problem themselves:
   interactions have all been played back already, ``"no_match"`` when
   recorded requests are similar but none matches, and ``"nothing_similar"``
   when nothing in the cassette is similar.
-- ``similar_requests``: the closest recorded requests, as
-  ``(request, succeeded_matchers, failed_matchers)`` tuples, where
-  ``failed_matchers`` is a list of ``(matcher_name, message)`` tuples.
+- ``similar_requests``: at most three of the closest recorded requests, as
+  ``(request, succeeded_matchers, failed_matchers, index)`` tuples. ``index``
+  is the interaction's zero-based position in the cassette file,
+  ``succeeded_matchers`` lists the matcher names that passed, and
+  ``failed_matchers`` is a list of ``(matcher_name, message)`` tuples in
+  ``match_on`` order, so the first entry is the first effective difference.
+  Requests that score equally keep their cassette order. Building this list
+  only reads the cassette and never changes play counts, so it is safe to use
+  from offline log analysis. Custom matchers that return a boolean or assert
+  directly are both supported.

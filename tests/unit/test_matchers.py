@@ -316,6 +316,17 @@ def test_get_assertion_message():
     assert matchers.get_assertion_message("") == ""
 
 
+def test_get_matchers_results_names_callables_without_name():
+    class CallableMatcher:
+        def __call__(self, r1, r2):
+            return False
+
+    matcher = CallableMatcher()
+    successes, failures = matchers.get_matchers_results(None, None, [matcher])
+    assert successes == []
+    assert [(name, message) for name, message in failures] == [(repr(matcher), None)]
+
+
 def test_get_assertion_message_with_details():
     assertion_msg = "q1=1 != q2=1"
     expected = assertion_msg

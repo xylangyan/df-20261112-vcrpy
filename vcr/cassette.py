@@ -9,7 +9,7 @@ from inspect import iscoroutinefunction
 import wrapt
 
 from ._handle_coroutine import handle_coroutine
-from .errors import MissingMetadataError, UnhandledHTTPRequestError
+from .errors import MAX_SIMILAR_REQUESTS, MissingMetadataError, UnhandledHTTPRequestError
 from .filters import sensitive_data_hooks
 from .matchers import get_matchers_results, method, requests_match, uri
 from .patch import CassettePatcherBuilder, validate_skip_patchers
@@ -336,16 +336,25 @@ class Cassette:
         - the request object
         - the successful matchers as string
         - the failed matchers and the related assertion message with the difference details as strings tuple
+        - the index of the interaction in the cassette file
+
+        At most MAX_SIMILAR_REQUESTS requests are returned, the ones with the
+        most successful matchers first. Requests with the same number of
+        successful matchers are ordered by their position in the cassette, so
+        the result is stable. This only reads the cassette: it doesn't change
+        play counts or mark anything as played.
 
         This is useful when a request failed to be found,
         we can get the similar request(s) in order to know what have changed in the request parts.
         """
         best_matches = []
         request = self._before_record_request(request)
-        for _, (stored_request, _) in enumerate(self.data):
+        for index, (stored_request, _) in enumerate(self.data):
             successes, fails = get_matchers_results(request, stored_request, self._match_on)
-            best_matches.append((len(successes), stored_request, successes, fails))
-        best_matches.sort(key=lambda t: t[0], reverse=True)
+            best_matches.append((len(successes), index, stored_request, successes, fails))
+        # Sort by the number of successful matchers, then by the position in
+        # the cassette so equally good matches keep a stable order.
+        best_matches.sort(key=lambda t: (-t[0], t[1]))
         # Get the first best matches (multiple if equal matches)
         final_best_matches = []
 
@@ -361,7 +370,10 @@ class Cassette:
             if nb_success < 1 or previous_nb_success != nb_success:
                 break
             previous_nb_success = nb_success
-            final_best_matches.append(best_match[1:])
+            _nb_success, index, stored_request, successes, fails = best_match
+            final_best_matches.append((stored_request, successes, fails, index))
+            if len(final_best_matches) >= MAX_SIMILAR_REQUESTS:
+                break
 
         return final_best_matches
 

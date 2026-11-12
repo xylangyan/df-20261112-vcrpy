@@ -5,6 +5,7 @@ All help in providing PRs to close out bug issues is appreciated. Even if that i
 
 -  Unreleased
     - CI: also test with urllib3 1.26, which vcrpy supports but CI didn't test, so #1092 wasn't caught
+    - ``CannotOverwriteExistingCassetteException.similar_requests`` tuples now include the interaction's zero-based position in the cassette file as a fourth element ``(request, succeeded_matchers, failed_matchers, index)``, and at most three closest interactions are attached. Interactions with the same matcher score keep their cassette order, so the diagnostic is stable and small enough for offline log analysis. Building it only reads the cassette and never changes play counts; custom matchers that return a boolean or assert directly are both supported, and matchers without ``__name__`` no longer break the diagnostic
 
 -  9.4.2
     - Fix urllib3 pools with ``block=True``, e.g. a requests session with ``HTTPAdapter(pool_block=True)``, waiting forever for a free connection in a cassette, or when used before, after or across cassettes. A response now returns its connection to the pool once its body has been read, as in urllib3, and vcrpy keeps a pool's free slots when it takes connections out of it as a cassette starts or stops using the pool. A response finished after its cassette has exited gives back only the slot, not the cassette's connection (#949) - thanks @nk-batman21
