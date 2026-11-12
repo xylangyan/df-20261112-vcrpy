@@ -1,0 +1,587 @@
+import gzip
+import json
+import zlib
+from io import BytesIO
+from unittest import mock
+
+import pytest
+from urllib3 import encode_multipart_formdata
+
+from vcr.filters import (
+    decode_response,
+    remove_headers,
+    remove_post_data_parameters,
+    remove_query_parameters,
+    replace_body_parameters,
+    replace_headers,
+    replace_post_data_parameters,
+    replace_query_parameters,
+    replace_text,
+)
+from vcr.request import Request
+
+
+def test_replace_headers():
+    # This tests all of:
+    #   1. keeping a header
+    #   2. removing a header
+    #   3. replacing a header
+    #   4. replacing a header using a callable
+    #   5. removing a header using a callable
+    #   6. replacing a header that doesn't exist
+    headers = {"one": ["keep"], "two": ["lose"], "three": ["change"], "four": ["shout"], "five": ["whisper"]}
+    request = Request("GET", "http://google.com", "", headers)
+    replace_headers(
+        request,
+        [
+            ("two", None),
+            ("three", "tada"),
+            ("four", lambda key, value, request: value.upper()),
+            ("five", lambda key, value, request: None),
+            ("six", "doesntexist"),
+        ],
+    )
+    assert request.headers == {"one": "keep", "three": "tada", "four": "SHOUT"}
+
+
+def test_replace_headers_empty():
+    headers = {"hello": "goodbye", "secret": "header"}
+    request = Request("GET", "http://google.com", "", headers)
+    replace_headers(request, [])
+    assert request.headers == headers
+
+
+def test_replace_headers_callable():
+    # This goes beyond test_replace_headers() to ensure that the callable
+    # receives the expected arguments.
+    headers = {"hey": "there"}
+    request = Request("GET", "http://google.com", "", headers)
+    callme = mock.Mock(return_value="ho")
+    replace_headers(request, [("hey", callme)])
+    assert request.headers == {"hey": "ho"}
+    assert callme.call_args == ((), {"request": request, "key": "hey", "value": "there"})
+
+
+def test_remove_headers():
+    # Test the backward-compatible API wrapper.
+    headers = {"hello": ["goodbye"], "secret": ["header"]}
+    request = Request("GET", "http://google.com", "", headers)
+    remove_headers(request, ["secret"])
+    assert request.headers == {"hello": "goodbye"}
+
+
+def test_replace_query_parameters():
+    # This tests all of:
+    #   1. keeping a parameter
+    #   2. removing a parameter
+    #   3. replacing a parameter
+    #   4. replacing a parameter using a callable
+    #   5. removing a parameter using a callable
+    #   6. replacing a parameter that doesn't exist
+    uri = "http://g.com/?one=keep&two=lose&three=change&four=shout&five=whisper"
+    request = Request("GET", uri, "", {})
+    replace_query_parameters(
+        request,
+        [
+            ("two", None),
+            ("three", "tada"),
+            ("four", lambda key, value, request: value.upper()),
+            ("five", lambda key, value, request: None),
+            ("six", "doesntexist"),
+        ],
+    )
+    assert request.query == [("four", "SHOUT"), ("one", "keep"), ("three", "tada")]
+
+
+def test_remove_all_query_parameters():
+    uri = "http://g.com/?q=cowboys&w=1"
+    request = Request("GET", uri, "", {})
+    replace_query_parameters(request, [("w", None), ("q", None)])
+    assert request.uri == "http://g.com/"
+
+
+def test_replace_query_parameters_callable():
+    # This goes beyond test_replace_query_parameters() to ensure that the
+    # callable receives the expected arguments.
+    uri = "http://g.com/?hey=there"
+    request = Request("GET", uri, "", {})
+    callme = mock.Mock(return_value="ho")
+    replace_query_parameters(request, [("hey", callme)])
+    assert request.uri == "http://g.com/?hey=ho"
+    assert callme.call_args == ((), {"request": request, "key": "hey", "value": "there"})
+
+
+def test_remove_query_parameters():
+    # Test the backward-compatible API wrapper.
+    uri = "http://g.com/?q=cowboys&w=1"
+    request = Request("GET", uri, "", {})
+    remove_query_parameters(request, ["w"])
+    assert request.uri == "http://g.com/?q=cowboys"
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
+def test_replace_body_parameters_form_encoded(method):
+    # This tests all of:
+    #   1. keeping a parameter
+    #   2. removing a parameter
+    #   3. replacing a parameter
+    #   4. replacing a parameter using a callable
+    #   5. removing a parameter using a callable
+    #   6. replacing a parameter that doesn't exist
+    body = b"one=keep&two=lose&three=change&four=shout&five=whisper"
+    request = Request(method, "http://google.com", body, {})
+    replace_body_parameters(
+        request,
+        [
+            ("two", None),
+            ("three", "tada"),
+            ("four", lambda key, value, request: value.upper()),
+            ("five", lambda key, value, request: None),
+            ("six", "doesntexist"),
+        ],
+    )
+    assert request.body == b"one=keep&three=tada&four=SHOUT"
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH"])
+def test_replace_body_parameters_form_encoded_empty_body(method):
+    # This test ensures replace_post_data_parameters doesn't throw exception when body is empty.
+    request = Request(method, "http://google.com", None, {})
+    replace_body_parameters(
+        request,
+        [
+            ("two", None),
+            ("three", "tada"),
+        ],
+    )
+    assert request.body is None
+
+
+def test_replace_post_data_parameters_with_encoded_names():
+    # The urlencoded form of {"api:key": "secret", "clé": "secret", "user name": "bob", "foo": "bar"}
+    body = b"api%3Akey=secret&cl%C3%A9=secret&user+name=bob&foo=bar"
+    request = Request("POST", "http://google.com", body, {})
+    replace_post_data_parameters(request, [("api:key", None), ("clé", None), ("user name", "alice")])
+    assert request.body == b"user+name=alice&foo=bar"
+
+
+def test_replace_post_data_parameters_with_already_encoded_names():
+    body = b"api%3Akey=secret&foo=bar"
+    request = Request("POST", "http://google.com", body, {})
+    replace_post_data_parameters(request, [("api%3Akey", None)])
+    assert request.body == b"foo=bar"
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH"])
+def test_remove_body_parameters_form_encoded(method):
+    body = b"id=secret&foo=bar"
+    request = Request(method, "http://google.com", body, {})
+    replacements = [("id", None)]
+    replace_body_parameters(request, replacements)
+    assert request.body == b"foo=bar"
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH"])
+def test_preserve_multiple_body_parameters(method):
+    body = b"id=secret&foo=bar&foo=baz"
+    request = Request(method, "http://google.com", body, {})
+    replace_body_parameters(request, [("id", None)])
+    assert request.body == b"foo=bar&foo=baz"
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH"])
+def test_remove_all_body_parameters_form_encoded(method):
+    body = b"id=secret&foo=bar"
+    request = Request(method, "http://google.com", body, {})
+    replace_body_parameters(request, [("id", None), ("foo", None)])
+    assert request.body == b""
+
+
+def test_replace_post_data_parameters_binary_body():
+    # A binary payload -- e.g. a file posted as raw bytes -- is not urlencoded
+    # form data, even though it may well contain b"=" and b"&". It must be left
+    # untouched instead of raising UnicodeDecodeError (#660).
+    body = b"\xff\xd8\xff\xe1\x00\xe8Exif=1&two=lose"
+    request = Request(
+        "POST",
+        "http://google.com",
+        body,
+        {"Content-Type": "application/octet-stream"},
+    )
+    replace_post_data_parameters(request, [("two", None)])
+    assert request.body == body
+
+
+def test_replace_post_data_parameters_binary_bytearray_body():
+    body = bytearray(b"\xff\xd8\xff\xe1=1&two=lose")
+    request = Request("POST", "http://google.com", body, {})
+    replace_post_data_parameters(request, [("two", None)])
+    assert request.body == body
+
+
+def test_replace_post_data_parameters_keyless_segment():
+    # A segment without "=" is not a key/value pair, so it must not be treated
+    # as a parameter to replace.
+    body = b"two&one=keep"
+    request = Request("POST", "http://google.com", body, {})
+    replace_post_data_parameters(request, [("two", "shout")])
+    assert request.body == b"two&one=keep"
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH"])
+def test_replace_body_parameters_json(method):
+    # This tests all of:
+    #   1. keeping a parameter
+    #   2. removing a parameter
+    #   3. replacing a parameter
+    #   4. replacing a parameter using a callable
+    #   5. removing a parameter using a callable
+    #   6. replacing a parameter that doesn't exist
+    body = b'{"one": "keep", "two": "lose", "three": "change", "four": "shout", "five": "whisper"}'
+    request = Request(method, "http://google.com", body, {})
+    request.headers["Content-Type"] = "application/json"
+    replace_body_parameters(
+        request,
+        [
+            ("two", None),
+            ("three", "tada"),
+            ("four", lambda key, value, request: value.upper()),
+            ("five", lambda key, value, request: None),
+            ("six", "doesntexist"),
+        ],
+    )
+    request_data = json.loads(request.body)
+    expected_data = json.loads('{"one": "keep", "three": "tada", "four": "SHOUT"}')
+    assert request_data == expected_data
+
+
+NESTED_BODY = {
+    "password": "top",
+    "params": {
+        "credentials": {"login": "name", "password": "secret"},
+        "users": [{"name": "a", "password": "p1"}, {"name": "b"}, "password"],
+        "empty": {},
+        "token": "t0k3n",
+    },
+}
+
+
+def test_replace_body_parameters_json_recursive():
+    request = Request("PUT", "http://google.com", json.dumps(NESTED_BODY).encode(), {})
+    request.headers["Content-Type"] = "application/json"
+    replace_body_parameters(
+        request,
+        [("password", None), ("token", lambda key, value, request: value.upper()), ("login", "<LOGIN>")],
+        recursive=True,
+    )
+    assert json.loads(request.body) == {
+        "params": {
+            "credentials": {"login": "<LOGIN>"},
+            # Lists are searched too, and strings in them aren't keys.
+            "users": [{"name": "a"}, {"name": "b"}, "password"],
+            # Objects left empty, or empty to begin with, are kept.
+            "empty": {},
+            "token": "T0K3N",
+        },
+    }
+
+
+def test_replace_body_parameters_dict_recursive():
+    request = Request("POST", "http://google.com", "", {})
+    request.body = NESTED_BODY
+    replace_body_parameters(request, [("password", None)], recursive=True)
+    assert request.body["params"]["credentials"] == {"login": "name"}
+    assert "password" not in request.body
+    # The original body isn't changed.
+    assert NESTED_BODY["params"]["credentials"]["password"] == "secret"
+
+
+def test_replace_body_parameters_json_not_recursive_by_default():
+    request = Request("POST", "http://google.com", json.dumps(NESTED_BODY).encode(), {})
+    request.headers["Content-Type"] = "application/json"
+    replace_body_parameters(request, [("password", None)])
+    data = json.loads(request.body)
+    assert "password" not in data
+    assert data["params"]["credentials"]["password"] == "secret"
+
+
+def test_replace_post_data_parameters_recursive():
+    request = Request("POST", "http://google.com", json.dumps(NESTED_BODY).encode(), {})
+    request.headers["Content-Type"] = "application/json"
+    replace_post_data_parameters(request, [("password", None)], recursive=True)
+    assert json.loads(request.body)["params"]["credentials"] == {"login": "name"}
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH"])
+def test_remove_body_parameters_json(method):
+    body = b'{"id": "secret", "foo": "bar", "baz": "qux"}'
+    request = Request(method, "http://google.com", body, {})
+    request.headers["Content-Type"] = "application/json"
+    replace_body_parameters(request, [("id", None)])
+    request_body_json = json.loads(request.body)
+    expected_json = json.loads(b'{"foo": "bar", "baz": "qux"}')
+    assert request_body_json == expected_json
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH"])
+def test_remove_all_body_parameters_json(method):
+    body = b'{"id": "secret", "foo": "bar"}'
+    request = Request(method, "http://google.com", body, {})
+    request.headers["Content-Type"] = "application/json"
+    replace_body_parameters(request, [("id", None), ("foo", None)])
+    assert request.body == b"{}"
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH"])
+def test_replace_body_parameters_dict(method):
+    # This tests all of:
+    #   1. keeping a parameter
+    #   2. removing a parameter
+    #   3. replacing a parameter
+    #   4. replacing a parameter using a callable
+    #   5. removing a parameter using a callable
+    #   6. replacing a parameter that doesn't exist
+    body = {"one": "keep", "two": "lose", "three": "change", "four": "shout", "five": "whisper"}
+    request = Request(method, "http://google.com", body, {})
+    request.headers["Content-Type"] = "application/x-www-form-urlencoded"
+    replace_body_parameters(
+        request,
+        [
+            ("two", None),
+            ("three", "tada"),
+            ("four", lambda key, value, request: value.upper()),
+            ("five", lambda key, value, request: None),
+            ("six", "doesntexist"),
+        ],
+    )
+    expected_data = {"one": "keep", "three": "tada", "four": "SHOUT"}
+    assert request.body == expected_data
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH"])
+def test_remove_body_parameters_dict(method):
+    body = {"id": "secret", "foo": "bar", "baz": "qux"}
+    request = Request(method, "http://google.com", body, {})
+    request.headers["Content-Type"] = "application/x-www-form-urlencoded"
+    replace_body_parameters(request, [("id", None)])
+    expected_data = {"foo": "bar", "baz": "qux"}
+    assert request.body == expected_data
+
+
+def _multipart_request(fields, boundary="vcrpy-boundary", content_type=None):
+    body, default_content_type = encode_multipart_formdata(fields, boundary=boundary)
+    return Request("POST", "http://google.com", body, {"Content-Type": content_type or default_content_type})
+
+
+def test_replace_body_parameters_multipart():
+    request = _multipart_request(
+        {
+            "keep": "kept",
+            "remove": "secret",
+            "replace": "secret",
+            "shout": "whisper",
+            "file": ("name", b"\xff\xfe binary secret"),
+        },
+    )
+    replace_body_parameters(
+        request,
+        [
+            ("remove", None),
+            ("replace", "<REPLACED>"),
+            ("shout", lambda key, value, request: value.upper()),
+            ("missing", "doesntexist"),
+        ],
+    )
+    expected = _multipart_request(
+        {
+            "keep": "kept",
+            "replace": "<REPLACED>",
+            "shout": "WHISPER",
+            "file": ("name", b"\xff\xfe binary secret"),
+        },
+    )
+    assert request.body == expected.body
+
+
+def test_replace_body_parameters_multipart_matches_name_not_filename():
+    request = _multipart_request({"upload": ("secret", b"content")})
+    replace_body_parameters(request, [("secret", None)])
+    assert request.body == _multipart_request({"upload": ("secret", b"content")}).body
+
+
+def test_replace_body_parameters_multipart_quoted_boundary():
+    request = _multipart_request(
+        {"api_key": "secret", "a": "b"},
+        content_type='multipart/form-data; boundary="vcrpy-boundary"',
+    )
+    replace_body_parameters(request, [("api_key", None)])
+    assert request.body == _multipart_request({"a": "b"}).body
+
+
+def test_replace_body_parameters_leaves_iterator_body():
+    # A generator body is recorded as an iterator body, which isn't filtered (#814).
+    request = Request("POST", "http://google.com", iter([b"api_key=secret"]), {})
+    replace_body_parameters(request, [("api_key", None)])
+    assert b"".join(request.body) == b"api_key=secret"
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH"])
+def test_remove_all_body_parameters_dict(method):
+    body = {"id": "secret", "foo": "bar"}
+    request = Request(method, "http://google.com", body, {})
+    request.headers["Content-Type"] = "application/x-www-form-urlencoded"
+    replace_body_parameters(request, [("id", None), ("foo", None)])
+    assert request.body == {}
+
+
+def test_replace_post_data_parameters_delegates_for_post():
+    # Test the backward-compatible API wrapper.
+    body = b"one=keep&two=lose&three=change"
+    request = Request("POST", "http://google.com", body, {})
+    replace_post_data_parameters(
+        request,
+        [
+            ("two", None),
+            ("three", "tada"),
+        ],
+    )
+    assert request.body == b"one=keep&three=tada"
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE", "OPTIONS"])
+def test_replace_post_data_parameters_ignores_non_post(method):
+    # Test the backward-compatible API wrapper.
+    body = b"one=keep&two=lose"
+    request = Request(method, "http://google.com", body, {})
+    replace_post_data_parameters(request, [("two", None)])
+    assert request.body == b"one=keep&two=lose"
+
+
+def test_remove_post_data_parameters():
+    # Test the backward-compatible API wrapper.
+    body = b"id=secret&foo=bar"
+    request = Request("POST", "http://google.com", body, {})
+    remove_post_data_parameters(request, ["id"])
+    assert request.body == b"foo=bar"
+
+
+def test_decode_response_uncompressed():
+    recorded_response = {
+        "status": {"message": "OK", "code": 200},
+        "headers": {
+            "content-length": ["10806"],
+            "date": ["Fri, 24 Oct 2014 18:35:37 GMT"],
+            "content-type": ["text/html; charset=utf-8"],
+        },
+        "body": {"string": b""},
+    }
+    assert decode_response(recorded_response) == recorded_response
+
+
+def test_decode_response_deflate():
+    body = b"deflate message"
+    deflate_response = {
+        "body": {"string": zlib.compress(body)},
+        "headers": {
+            "access-control-allow-credentials": ["true"],
+            "access-control-allow-origin": ["*"],
+            "connection": ["keep-alive"],
+            "content-encoding": ["deflate"],
+            "content-length": ["177"],
+            "content-type": ["application/json"],
+            "date": ["Wed, 02 Dec 2015 19:44:32 GMT"],
+            "server": ["nginx"],
+        },
+        "status": {"code": 200, "message": "OK"},
+    }
+    decoded_response = decode_response(deflate_response)
+    assert decoded_response["body"]["string"] == body
+    assert decoded_response["headers"]["content-length"] == [str(len(body))]
+
+
+def test_decode_response_deflate_already_decompressed():
+    body = b"deflate message"
+    gzip_response = {
+        "body": {"string": body},
+        "headers": {
+            "content-encoding": ["deflate"],
+        },
+    }
+    decoded_response = decode_response(gzip_response)
+    assert decoded_response["body"]["string"] == body
+
+
+def test_decode_response_gzip():
+    body = b"gzip message"
+
+    buf = BytesIO()
+    f = gzip.GzipFile("a", fileobj=buf, mode="wb")
+    f.write(body)
+    f.close()
+
+    compressed_body = buf.getvalue()
+    buf.close()
+    gzip_response = {
+        "body": {"string": compressed_body},
+        "headers": {
+            "access-control-allow-credentials": ["true"],
+            "access-control-allow-origin": ["*"],
+            "connection": ["keep-alive"],
+            "content-encoding": ["gzip"],
+            "content-length": ["177"],
+            "content-type": ["application/json"],
+            "date": ["Wed, 02 Dec 2015 19:44:32 GMT"],
+            "server": ["nginx"],
+        },
+        "status": {"code": 200, "message": "OK"},
+    }
+    decoded_response = decode_response(gzip_response)
+    assert decoded_response["body"]["string"] == body
+    assert decoded_response["headers"]["content-length"] == [str(len(body))]
+
+
+def test_decode_response_gzip_already_decompressed():
+    body = b"gzip message"
+    gzip_response = {
+        "body": {"string": body},
+        "headers": {
+            "content-encoding": ["gzip"],
+        },
+    }
+    decoded_response = decode_response(gzip_response)
+    assert decoded_response["body"]["string"] == body
+
+
+def test_replace_post_data_parameters_still_only_filters_post():
+    # The old function keeps its POST-only behavior for code that calls it directly.
+    request = Request("PUT", "http://google.com", b"id=secret&foo=bar", {})
+    replace_post_data_parameters(request, [("id", None)])
+    assert request.body == b"id=secret&foo=bar"
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE"])
+def test_filter_post_data_parameters_filters_every_method(method):
+    import vcr
+
+    before_record_request = vcr.VCR(filter_post_data_parameters=["id"])._build_before_record_request({})
+    request = Request(method, "http://google.com", b"id=secret&foo=bar", {})
+    assert before_record_request(request).body == b"foo=bar"
+
+
+def test_replace_text():
+    original = {
+        "uri": "http://x/?key=SECRET",
+        "headers": {"Authorization": ["Bearer SECRET"], "X-SECRET": ["1"]},
+        "body": b"token=SECRET",
+        "nested": [("SECRET", BytesIO(b"SECRET!")), 42, None],
+    }
+    replaced = replace_text(original, "SECRET", "<KEY>")
+    assert replaced["uri"] == "http://x/?key=<KEY>"
+    assert replaced["headers"] == {"Authorization": ["Bearer <KEY>"], "X-<KEY>": ["1"]}
+    assert replaced["body"] == b"token=<KEY>"
+    assert replaced["nested"][0][0] == "<KEY>"
+    assert replaced["nested"][0][1].getvalue() == b"<KEY>!"
+    assert replaced["nested"][1:] == [42, None]
+    # The original is left untouched.
+    assert original["uri"] == "http://x/?key=SECRET"
+    assert original["body"] == b"token=SECRET"

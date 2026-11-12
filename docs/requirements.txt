@@ -1,0 +1,2 @@
+sphinx<10
+sphinx_rtd_theme==3.1.0

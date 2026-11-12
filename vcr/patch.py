@@ -1,0 +1,787 @@
+"""Utilities for patching in cassettes"""
+
+import contextlib
+import functools
+import http.client as httplib
+import itertools
+import logging
+import queue
+from unittest import mock
+
+from .stubs import VCRHTTPConnection, VCRHTTPSConnection
+
+log = logging.getLogger(__name__)
+# Save some of the original types for the purposes of unpatching
+_HTTPConnection = httplib.HTTPConnection
+_HTTPSConnection = httplib.HTTPSConnection
+
+# Try to save the original types for boto3
+try:
+    from botocore.awsrequest import AWSHTTPConnection, AWSHTTPSConnection
+except ImportError as e:
+    try:
+        import botocore.vendored.requests  # noqa: F401
+    except ImportError:  # pragma: no cover
+        pass
+    else:
+        raise RuntimeError(
+            "vcrpy >=4.2.2 and botocore <1.11.0 are not compatible"
+            "; please upgrade botocore (or downgrade vcrpy)",
+        ) from e
+else:
+    _Boto3VerifiedHTTPSConnection = AWSHTTPSConnection
+    _cpoolBoto3HTTPConnection = AWSHTTPConnection
+    _cpoolBoto3HTTPSConnection = AWSHTTPSConnection
+
+cpool = None
+conn = None
+# Try to save the original types for urllib3
+try:
+    import urllib3.connection as conn
+    import urllib3.connectionpool as cpool
+except ImportError:  # pragma: no cover
+    pass
+else:
+    _VerifiedHTTPSConnection = conn.VerifiedHTTPSConnection
+    _connHTTPConnection = conn.HTTPConnection
+    _connHTTPSConnection = conn.HTTPSConnection
+
+# Try to save the original types for requests
+try:
+    import requests
+except ImportError:  # pragma: no cover
+    pass
+else:
+    if requests.__build__ < 0x021602:
+        raise RuntimeError(
+            "vcrpy >=4.2.2 and requests <2.16.2 are not compatible"
+            "; please upgrade requests (or downgrade vcrpy)",
+        )
+
+
+# Try to save the original types for httplib2
+try:
+    import httplib2
+except ImportError:  # pragma: no cover
+    pass
+else:
+    _HTTPConnectionWithTimeout = httplib2.HTTPConnectionWithTimeout
+    _HTTPSConnectionWithTimeout = httplib2.HTTPSConnectionWithTimeout
+    _SCHEME_TO_CONNECTION = httplib2.SCHEME_TO_CONNECTION
+
+# Try to save the original types for Tornado
+try:
+    import tornado.simple_httpclient
+except ImportError:  # pragma: no cover
+    pass
+else:
+    _SimpleAsyncHTTPClient_fetch_impl = tornado.simple_httpclient.SimpleAsyncHTTPClient.fetch_impl
+
+try:
+    import tornado.curl_httpclient
+except ImportError:  # pragma: no cover
+    pass
+else:
+    _CurlAsyncHTTPClient_fetch_impl = tornado.curl_httpclient.CurlAsyncHTTPClient.fetch_impl
+
+try:
+    import aiohttp.client
+except ImportError:  # pragma: no cover
+    pass
+else:
+    _AiohttpClientSessionRequest = aiohttp.client.ClientSession._request
+
+
+try:
+    import httpx
+except ImportError:  # pragma: no cover
+    pass
+else:
+    _HttpxHttpTransport_handle_request = httpx.HTTPTransport.handle_request
+    _HttpxAsyncHttpTransport_handle_async_request = httpx.AsyncHTTPTransport.handle_async_request
+    _HttpxWsgiTransport_handle_request = httpx.WSGITransport.handle_request
+    _HttpxAsgiTransport_handle_async_request = httpx.ASGITransport.handle_async_request
+    _HttpxMockTransport_handle_request = httpx.MockTransport.handle_request
+    _HttpxMockTransport_handle_async_request = httpx.MockTransport.handle_async_request
+
+try:
+    import httpx_curl_cffi
+except ImportError:  # pragma: no cover
+    pass
+else:
+    _HttpxCurlTransport_handle_request = httpx_curl_cffi.CurlTransport.handle_request
+    _HttpxAsyncCurlTransport_handle_async_request = httpx_curl_cffi.AsyncCurlTransport.handle_async_request
+
+try:
+    import pyreqwest.compatibility.httpx
+except ImportError:  # pragma: no cover
+    pass
+else:
+    _HttpxSyncPyreqwestTransport_handle_request = (
+        pyreqwest.compatibility.httpx.SyncHttpxTransport.handle_request
+    )
+    _HttpxPyreqwestTransport_handle_async_request = (
+        pyreqwest.compatibility.httpx.HttpxTransport.handle_async_request
+    )
+
+
+try:
+    import httpx2
+except ImportError:  # pragma: no cover
+    pass
+else:
+    _Httpx2HttpTransport_handle_request = httpx2.HTTPTransport.handle_request
+    _Httpx2AsyncHttpTransport_handle_async_request = httpx2.AsyncHTTPTransport.handle_async_request
+    _Httpx2WsgiTransport_handle_request = httpx2.WSGITransport.handle_request
+    _Httpx2AsgiTransport_handle_async_request = httpx2.ASGITransport.handle_async_request
+    _Httpx2MockTransport_handle_request = httpx2.MockTransport.handle_request
+    _Httpx2MockTransport_handle_async_request = httpx2.MockTransport.handle_async_request
+
+
+# Names of the patcher groups built by CassettePatcherBuilder.build().
+# These are the accepted values for the ``skip_patchers`` option, which
+# lets users turn off patching for individual HTTP libraries -- for
+# example, skipping "httpx" when a layered client (such as httpx-aiohttp)
+# would otherwise be recorded twice: once by the httpx patcher and once
+# by the patcher for the transport library underneath it.
+PATCHER_NAMES = (
+    "httplib",
+    "requests",
+    "boto3",
+    "urllib3",
+    "httplib2",
+    "tornado",
+    "aiohttp",
+    "httpx",
+    "httpx2",
+)
+
+
+def validate_skip_patchers(skip_patchers):
+    skip_patchers = tuple(skip_patchers)
+    unknown = sorted(set(skip_patchers) - set(PATCHER_NAMES))
+    if unknown:
+        raise ValueError(
+            f"Unknown patcher(s) in skip_patchers: {', '.join(unknown)}. "
+            f"Valid patcher names are: {', '.join(PATCHER_NAMES)}",
+        )
+    return skip_patchers
+
+
+class CassettePatcherBuilder:
+    def _build_patchers_from_mock_triples_decorator(function):
+        @functools.wraps(function)
+        def wrapped(self, *args, **kwargs):
+            return self._build_patchers_from_mock_triples(function(self, *args, **kwargs))
+
+        return wrapped
+
+    def __init__(self, cassette):
+        self._cassette = cassette
+        self._class_to_cassette_subclass = {}
+
+    def build(self):
+        skip = set(getattr(self._cassette, "skip_patchers", ()))
+        groups = (
+            ("httplib", self._httplib),
+            ("requests", self._requests),
+            ("boto3", self._boto3),
+            ("urllib3", self._urllib3),
+            ("httplib2", self._httplib2),
+            ("tornado", self._tornado),
+            ("aiohttp", self._aiohttp),
+            ("httpx", self._httpx),
+            ("httpx2", self._httpx2),
+        )
+        return itertools.chain(
+            *(builder() for name, builder in groups if name not in skip),
+            self._build_patchers_from_mock_triples(self._cassette.custom_patches),
+        )
+
+    def _build_patchers_from_mock_triples(self, mock_triples):
+        for args in mock_triples:
+            patcher = self._build_patcher(*args)
+            if patcher:
+                yield patcher
+
+    def _build_patcher(self, obj, patched_attribute, replacement_class):
+        if not hasattr(obj, patched_attribute):
+            return
+
+        return mock.patch.object(
+            obj,
+            patched_attribute,
+            self._recursively_apply_get_cassette_subclass(replacement_class),
+        )
+
+    def _recursively_apply_get_cassette_subclass(self, replacement_dict_or_obj):
+        """One of the subtleties of this class is that it does not directly
+        replace HTTPSConnection with `VCRRequestsHTTPSConnection`, but a
+        subclass of the aforementioned class that has the `cassette`
+        class attribute assigned to `self._cassette`. This behavior is
+        necessary to properly support nested cassette contexts.
+
+        This function exists to ensure that we use the same class
+        object (reference) to patch everything that replaces
+        VCRRequestHTTP[S]Connection, but that we can talk about
+        patching them with the raw references instead, and without
+        worrying about exactly where the subclass with the relevant
+        value for `cassette` is first created.
+
+        The function is recursive because it looks in to dictionaries
+        and replaces class values at any depth with the subclass
+        described in the previous paragraph.
+        """
+        if isinstance(replacement_dict_or_obj, dict):
+            for key, replacement_obj in replacement_dict_or_obj.items():
+                replacement_obj = self._recursively_apply_get_cassette_subclass(replacement_obj)
+                replacement_dict_or_obj[key] = replacement_obj
+            return replacement_dict_or_obj
+        if hasattr(replacement_dict_or_obj, "cassette"):
+            replacement_dict_or_obj = self._get_cassette_subclass(replacement_dict_or_obj)
+        return replacement_dict_or_obj
+
+    def _get_cassette_subclass(self, klass):
+        if klass.cassette is not None:
+            return klass
+        if klass not in self._class_to_cassette_subclass:
+            subclass = self._build_cassette_subclass(klass)
+            self._class_to_cassette_subclass[klass] = subclass
+        return self._class_to_cassette_subclass[klass]
+
+    def _build_cassette_subclass(self, base_class):
+        bases = (base_class,)
+        if not issubclass(base_class, object):  # Check for old style class
+            bases += (object,)
+        return type(f"{base_class.__name__}{self._cassette._path}", bases, {"cassette": self._cassette})
+
+    @_build_patchers_from_mock_triples_decorator
+    def _httplib(self):
+        yield httplib, "HTTPConnection", VCRHTTPConnection
+        yield httplib, "HTTPSConnection", VCRHTTPSConnection
+
+    def _requests(self):
+        try:
+            from .stubs import requests_stubs
+        except ImportError:  # pragma: no cover
+            return ()
+        return self._urllib3_patchers(cpool, conn, requests_stubs)
+
+    @_build_patchers_from_mock_triples_decorator
+    def _boto3(self):
+        try:
+            # botocore using awsrequest
+            import botocore.awsrequest as cpool
+        except ImportError:  # pragma: no cover
+            pass
+        else:
+            from .stubs import boto3_stubs
+
+            log.debug("Patching boto3 cpool with %s", cpool)
+            yield cpool.AWSHTTPConnectionPool, "ConnectionCls", boto3_stubs.VCRRequestsHTTPConnection
+            yield cpool.AWSHTTPSConnectionPool, "ConnectionCls", boto3_stubs.VCRRequestsHTTPSConnection
+
+    def _patched_get_conn(self, connection_pool_class, connection_class_getter):
+        get_conn = connection_pool_class._get_conn
+
+        @functools.wraps(get_conn)
+        def patched_get_conn(pool, timeout=None, **kwargs):
+            connection = get_conn(pool, timeout, **kwargs)
+            connection_class = (
+                pool.ConnectionCls if hasattr(pool, "ConnectionCls") else connection_class_getter()
+            )
+            # We need to make sure that we are actually providing a
+            # patched version of the connection class. This might not
+            # always be the case because the pool keeps previously
+            # used connections (which might actually be of a different
+            # class) around. This while loop will terminate because
+            # eventually the pool will run out of connections.
+            while not isinstance(connection, connection_class):
+                if isinstance(pool.pool, queue.Queue):
+                    # Drop it but keep its slot, or a blocking pool runs out of them (#949).
+                    connection.close()
+                    pool._put_conn(None)
+                connection = get_conn(pool, timeout, **kwargs)
+            return connection
+
+        return patched_get_conn
+
+    def _patched_new_conn(self, connection_pool_class, connection_remover):
+        new_conn = connection_pool_class._new_conn
+
+        @functools.wraps(new_conn)
+        def patched_new_conn(pool, **kwargs):
+            new_connection = new_conn(pool, **kwargs)
+            connection_remover.add_connection_to_pool_entry(pool, new_connection)
+            return new_connection
+
+        return patched_new_conn
+
+    def _urllib3(self):
+        try:
+            import urllib3.connection as conn
+            import urllib3.connectionpool as cpool
+        except ImportError:  # pragma: no cover
+            return ()
+        from .stubs import urllib3_stubs
+
+        return self._urllib3_patchers(cpool, conn, urllib3_stubs)
+
+    @_build_patchers_from_mock_triples_decorator
+    def _httplib2(self):
+        try:
+            import httplib2 as cpool
+        except ImportError:  # pragma: no cover
+            pass
+        else:
+            from .stubs.httplib2_stubs import VCRHTTPConnectionWithTimeout, VCRHTTPSConnectionWithTimeout
+
+            yield cpool, "HTTPConnectionWithTimeout", VCRHTTPConnectionWithTimeout
+            yield cpool, "HTTPSConnectionWithTimeout", VCRHTTPSConnectionWithTimeout
+            yield (
+                cpool,
+                "SCHEME_TO_CONNECTION",
+                {
+                    "http": VCRHTTPConnectionWithTimeout,
+                    "https": VCRHTTPSConnectionWithTimeout,
+                },
+            )
+
+    @_build_patchers_from_mock_triples_decorator
+    def _tornado(self):
+        try:
+            import tornado.simple_httpclient as simple
+        except ImportError:  # pragma: no cover
+            pass
+        else:
+            from .stubs.tornado_stubs import vcr_fetch_impl
+
+            new_fetch_impl = vcr_fetch_impl(self._cassette, _SimpleAsyncHTTPClient_fetch_impl)
+            yield simple.SimpleAsyncHTTPClient, "fetch_impl", new_fetch_impl
+        try:
+            import tornado.curl_httpclient as curl
+        except ImportError:  # pragma: no cover
+            pass
+        else:
+            from .stubs.tornado_stubs import vcr_fetch_impl
+
+            new_fetch_impl = vcr_fetch_impl(self._cassette, _CurlAsyncHTTPClient_fetch_impl)
+            yield curl.CurlAsyncHTTPClient, "fetch_impl", new_fetch_impl
+
+    @_build_patchers_from_mock_triples_decorator
+    def _aiohttp(self):
+        try:
+            import aiohttp.client as client
+        except ImportError:  # pragma: no cover
+            pass
+        else:
+            from .stubs.aiohttp_stubs import vcr_request
+
+            new_request = vcr_request(self._cassette, _AiohttpClientSessionRequest)
+            yield client.ClientSession, "_request", new_request
+
+    @_build_patchers_from_mock_triples_decorator
+    def _httpx(self):
+        try:
+            import httpx
+        except ImportError:  # pragma: no cover
+            pass
+        else:
+            from .stubs.httpx_stubs import vcr_handle_async_request, vcr_handle_request
+
+            new_handle_request = vcr_handle_request(self._cassette, _HttpxHttpTransport_handle_request, httpx)
+            yield httpx.HTTPTransport, "handle_request", new_handle_request
+
+            new_handle_async_request = vcr_handle_async_request(
+                self._cassette,
+                _HttpxAsyncHttpTransport_handle_async_request,
+                httpx,
+            )
+            yield httpx.AsyncHTTPTransport, "handle_async_request", new_handle_async_request
+
+            new_handle_request = vcr_handle_request(self._cassette, _HttpxWsgiTransport_handle_request, httpx)
+            yield httpx.WSGITransport, "handle_request", new_handle_request
+
+            new_handle_async_request = vcr_handle_async_request(
+                self._cassette,
+                _HttpxAsgiTransport_handle_async_request,
+                httpx,
+            )
+            yield httpx.ASGITransport, "handle_async_request", new_handle_async_request
+
+            new_handle_request = vcr_handle_request(self._cassette, _HttpxMockTransport_handle_request, httpx)
+            yield httpx.MockTransport, "handle_request", new_handle_request
+
+            new_handle_async_request = vcr_handle_async_request(
+                self._cassette,
+                _HttpxMockTransport_handle_async_request,
+                httpx,
+            )
+            yield httpx.MockTransport, "handle_async_request", new_handle_async_request
+
+        try:
+            import httpx_curl_cffi
+        except ImportError:  # pragma: no cover
+            pass
+        else:
+            from .stubs.httpx_stubs import vcr_handle_async_request, vcr_handle_request
+
+            new_handle_request = vcr_handle_request(self._cassette, _HttpxCurlTransport_handle_request, httpx)
+            yield httpx_curl_cffi.CurlTransport, "handle_request", new_handle_request
+
+            new_handle_async_request = vcr_handle_async_request(
+                self._cassette,
+                _HttpxAsyncCurlTransport_handle_async_request,
+                httpx,
+            )
+            yield httpx_curl_cffi.AsyncCurlTransport, "handle_async_request", new_handle_async_request
+
+        try:
+            import pyreqwest.compatibility.httpx
+        except ImportError:  # pragma: no cover
+            pass
+        else:
+            from .stubs.httpx_stubs import vcr_handle_async_request, vcr_handle_request
+
+            new_handle_request = vcr_handle_request(
+                self._cassette,
+                _HttpxSyncPyreqwestTransport_handle_request,
+                httpx,
+            )
+            yield pyreqwest.compatibility.httpx.SyncHttpxTransport, "handle_request", new_handle_request
+
+            new_handle_async_request = vcr_handle_async_request(
+                self._cassette,
+                _HttpxPyreqwestTransport_handle_async_request,
+                httpx,
+            )
+            yield (
+                pyreqwest.compatibility.httpx.HttpxTransport,
+                "handle_async_request",
+                new_handle_async_request,
+            )
+
+    @_build_patchers_from_mock_triples_decorator
+    def _httpx2(self):
+        try:
+            import httpx2
+        except ImportError:  # pragma: no cover
+            pass
+        else:
+            from .stubs.httpx_stubs import vcr_handle_async_request, vcr_handle_request
+
+            new_handle_request = vcr_handle_request(
+                self._cassette,
+                _Httpx2HttpTransport_handle_request,
+                httpx2,
+            )
+            yield httpx2.HTTPTransport, "handle_request", new_handle_request
+
+            new_handle_async_request = vcr_handle_async_request(
+                self._cassette,
+                _Httpx2AsyncHttpTransport_handle_async_request,
+                httpx2,
+            )
+            yield httpx2.AsyncHTTPTransport, "handle_async_request", new_handle_async_request
+
+            new_handle_request = vcr_handle_request(
+                self._cassette,
+                _Httpx2WsgiTransport_handle_request,
+                httpx2,
+            )
+            yield httpx2.WSGITransport, "handle_request", new_handle_request
+
+            new_handle_async_request = vcr_handle_async_request(
+                self._cassette,
+                _Httpx2AsgiTransport_handle_async_request,
+                httpx2,
+            )
+            yield httpx2.ASGITransport, "handle_async_request", new_handle_async_request
+
+            new_handle_request = vcr_handle_request(
+                self._cassette,
+                _Httpx2MockTransport_handle_request,
+                httpx2,
+            )
+            yield httpx2.MockTransport, "handle_request", new_handle_request
+
+            new_handle_async_request = vcr_handle_async_request(
+                self._cassette,
+                _Httpx2MockTransport_handle_async_request,
+                httpx2,
+            )
+            yield httpx2.MockTransport, "handle_async_request", new_handle_async_request
+
+    def _urllib3_patchers(self, cpool, conn, stubs):
+        http_connection_remover = ConnectionRemover(
+            self._get_cassette_subclass(stubs.VCRRequestsHTTPConnection),
+        )
+        https_connection_remover = ConnectionRemover(
+            self._get_cassette_subclass(stubs.VCRRequestsHTTPSConnection),
+        )
+
+        real_is_connection_dropped = cpool.is_connection_dropped
+
+        def is_connection_dropped(connection):
+            # vcrpy swaps urllib3's connection classes for socketless stubs.
+            # During playback a stub has no live socket, so urllib3's normal
+            # check would treat it as dropped and discard it -- originally a
+            # Windows playback fix (#116). But a stub that is *recording* wraps a
+            # real connection, and we must still run urllib3's real check against
+            # that underlying connection. Otherwise urllib3 reuses a keep-alive
+            # connection the server has already closed and raises a "Connection
+            # aborted" ProtocolError (the intermittent BrokenPipe in CI).
+            real_connection = getattr(connection, "real_connection", None)
+            if real_connection is None:
+                return real_is_connection_dropped(connection)
+            if getattr(real_connection, "sock", None) is None:
+                return False
+            return real_is_connection_dropped(real_connection)
+
+        mock_triples = (
+            (conn, "VerifiedHTTPSConnection", stubs.VCRRequestsHTTPSConnection),
+            (conn, "HTTPConnection", stubs.VCRRequestsHTTPConnection),
+            (conn, "HTTPSConnection", stubs.VCRRequestsHTTPSConnection),
+            (cpool, "is_connection_dropped", is_connection_dropped),
+            (cpool.HTTPConnectionPool, "ConnectionCls", stubs.VCRRequestsHTTPConnection),
+            (cpool.HTTPSConnectionPool, "ConnectionCls", stubs.VCRRequestsHTTPSConnection),
+        )
+        # These handle making sure that sessions only use the
+        # connections of the appropriate type.
+        mock_triples += (
+            (
+                cpool.HTTPConnectionPool,
+                "_get_conn",
+                self._patched_get_conn(cpool.HTTPConnectionPool, lambda: cpool.HTTPConnection),
+            ),
+            (
+                cpool.HTTPSConnectionPool,
+                "_get_conn",
+                self._patched_get_conn(cpool.HTTPSConnectionPool, lambda: cpool.HTTPSConnection),
+            ),
+            (
+                cpool.HTTPConnectionPool,
+                "_new_conn",
+                self._patched_new_conn(cpool.HTTPConnectionPool, http_connection_remover),
+            ),
+            (
+                cpool.HTTPSConnectionPool,
+                "_new_conn",
+                self._patched_new_conn(cpool.HTTPSConnectionPool, https_connection_remover),
+            ),
+        )
+
+        connection_removers = [http_connection_remover, https_connection_remover]
+        if hasattr(stubs, "VCRRequestsSOCKSConnection"):
+            # Pools for SOCKS proxies use their own connection classes (#547, #548).
+            from urllib3.contrib import socks
+
+            for pool_class, stub in (
+                (socks.SOCKSHTTPConnectionPool, stubs.VCRRequestsSOCKSConnection),
+                (socks.SOCKSHTTPSConnectionPool, stubs.VCRRequestsSOCKSHTTPSConnection),
+            ):
+                connection_remover = ConnectionRemover(self._get_cassette_subclass(stub))
+                connection_removers.append(connection_remover)
+                mock_triples += (
+                    (pool_class, "ConnectionCls", stub),
+                    (pool_class, "_new_conn", self._patched_new_conn(pool_class, connection_remover)),
+                )
+
+        return itertools.chain(
+            self._build_patchers_from_mock_triples(mock_triples),
+            connection_removers,
+        )
+
+
+class ConnectionRemover:
+    def __init__(self, connection_class):
+        self._connection_class = connection_class
+        self._connection_pool_to_connections = {}
+
+    def add_connection_to_pool_entry(self, pool, connection):
+        if isinstance(connection, self._connection_class):
+            self._connection_pool_to_connections.setdefault(pool, set()).add(connection)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        for pool, connections in self._connection_pool_to_connections.items():
+            readd_connections = []
+            while pool.pool and pool.pool.qsize() and connections:
+                connection = pool.pool.get()
+                if isinstance(connection, self._connection_class):
+                    connections.remove(connection)
+                    connection.close()
+                    if isinstance(pool.pool, queue.Queue):
+                        readd_connections.append(None)  # keep its slot
+                else:
+                    readd_connections.append(connection)
+            for connection in readd_connections:
+                pool._put_conn(connection)
+            for connection in connections:
+                # If a response still holds it, releasing it gives back only its slot.
+                connection._vcr_cassette_exited = True
+                connection.close()
+
+
+def reset_patchers():
+    yield mock.patch.object(httplib, "HTTPConnection", _HTTPConnection)
+    yield mock.patch.object(httplib, "HTTPSConnection", _HTTPSConnection)
+
+    try:
+        import urllib3.connection as conn
+        import urllib3.connectionpool as cpool
+    except ImportError:  # pragma: no cover
+        pass
+    else:
+        yield mock.patch.object(conn, "VerifiedHTTPSConnection", _VerifiedHTTPSConnection)
+        yield mock.patch.object(conn, "HTTPConnection", _connHTTPConnection)
+        yield mock.patch.object(conn, "HTTPSConnection", _connHTTPSConnection)
+        if hasattr(cpool.HTTPConnectionPool, "ConnectionCls"):
+            yield mock.patch.object(cpool.HTTPConnectionPool, "ConnectionCls", _connHTTPConnection)
+            yield mock.patch.object(cpool.HTTPSConnectionPool, "ConnectionCls", _connHTTPSConnection)
+
+    try:
+        # unpatch botocore with awsrequest
+        import botocore.awsrequest as cpool
+    except ImportError:  # pragma: no cover
+        pass
+    else:
+        if hasattr(cpool.AWSHTTPConnectionPool, "ConnectionCls"):
+            yield mock.patch.object(cpool.AWSHTTPConnectionPool, "ConnectionCls", _cpoolBoto3HTTPConnection)
+            yield mock.patch.object(cpool.AWSHTTPSConnectionPool, "ConnectionCls", _cpoolBoto3HTTPSConnection)
+
+        if hasattr(cpool, "AWSHTTPSConnection"):
+            yield mock.patch.object(cpool, "AWSHTTPSConnection", _cpoolBoto3HTTPSConnection)
+
+    try:
+        import httplib2 as cpool
+    except ImportError:  # pragma: no cover
+        pass
+    else:
+        yield mock.patch.object(cpool, "HTTPConnectionWithTimeout", _HTTPConnectionWithTimeout)
+        yield mock.patch.object(cpool, "HTTPSConnectionWithTimeout", _HTTPSConnectionWithTimeout)
+        yield mock.patch.object(cpool, "SCHEME_TO_CONNECTION", _SCHEME_TO_CONNECTION)
+
+    try:
+        import tornado.simple_httpclient as simple
+    except ImportError:  # pragma: no cover
+        pass
+    else:
+        yield mock.patch.object(simple.SimpleAsyncHTTPClient, "fetch_impl", _SimpleAsyncHTTPClient_fetch_impl)
+    try:
+        import tornado.curl_httpclient as curl
+    except ImportError:  # pragma: no cover
+        pass
+    else:
+        yield mock.patch.object(curl.CurlAsyncHTTPClient, "fetch_impl", _CurlAsyncHTTPClient_fetch_impl)
+
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover
+        pass
+    else:
+        yield mock.patch.object(
+            httpx.HTTPTransport,
+            "handle_request",
+            _HttpxHttpTransport_handle_request,
+        )
+        yield mock.patch.object(
+            httpx.AsyncHTTPTransport,
+            "handle_async_request",
+            _HttpxAsyncHttpTransport_handle_async_request,
+        )
+        yield mock.patch.object(
+            httpx.WSGITransport,
+            "handle_request",
+            _HttpxWsgiTransport_handle_request,
+        )
+        yield mock.patch.object(
+            httpx.ASGITransport,
+            "handle_async_request",
+            _HttpxAsgiTransport_handle_async_request,
+        )
+        yield mock.patch.object(
+            httpx.MockTransport,
+            "handle_request",
+            _HttpxMockTransport_handle_request,
+        )
+        yield mock.patch.object(
+            httpx.MockTransport,
+            "handle_async_request",
+            _HttpxMockTransport_handle_async_request,
+        )
+
+    try:
+        import httpx_curl_cffi
+    except ImportError:  # pragma: no cover
+        pass
+    else:
+        yield mock.patch.object(
+            httpx_curl_cffi.CurlTransport,
+            "handle_request",
+            _HttpxCurlTransport_handle_request,
+        )
+        yield mock.patch.object(
+            httpx_curl_cffi.AsyncCurlTransport,
+            "handle_async_request",
+            _HttpxAsyncCurlTransport_handle_async_request,
+        )
+
+    try:
+        import httpx2
+    except ImportError:  # pragma: no cover
+        pass
+    else:
+        yield mock.patch.object(
+            httpx2.HTTPTransport,
+            "handle_request",
+            _Httpx2HttpTransport_handle_request,
+        )
+        yield mock.patch.object(
+            httpx2.AsyncHTTPTransport,
+            "handle_async_request",
+            _Httpx2AsyncHttpTransport_handle_async_request,
+        )
+        yield mock.patch.object(
+            httpx2.WSGITransport,
+            "handle_request",
+            _Httpx2WsgiTransport_handle_request,
+        )
+        yield mock.patch.object(
+            httpx2.ASGITransport,
+            "handle_async_request",
+            _Httpx2AsgiTransport_handle_async_request,
+        )
+        yield mock.patch.object(
+            httpx2.MockTransport,
+            "handle_request",
+            _Httpx2MockTransport_handle_request,
+        )
+        yield mock.patch.object(
+            httpx2.MockTransport,
+            "handle_async_request",
+            _Httpx2MockTransport_handle_async_request,
+        )
+
+
+def _undo_reset(patcher, target, attribute, reset_to):
+    replaced_by = getattr(target, attribute, reset_to)
+    patcher.__exit__(None, None, None)
+    # A reset window is a suspended generator, so an abandoned one is unwound by
+    # the collector -- inside whatever cassette is running by then. Keep that
+    # cassette's patches: they are newer than the originals the patcher saved.
+    if replaced_by is not reset_to:
+        setattr(target, attribute, replaced_by)
+
+
+@contextlib.contextmanager
+def force_reset():
+    """Temporarily put back the real classes a cassette replaced."""
+    with contextlib.ExitStack() as exit_stack:
+        for patcher in reset_patchers():
+            patcher.__enter__()
+            target, attribute = patcher.target, patcher.attribute
+            exit_stack.callback(_undo_reset, patcher, target, attribute, getattr(target, attribute))
+        yield
